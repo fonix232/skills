@@ -50,6 +50,22 @@ class InboxTests(unittest.TestCase):
                 'title': 'First', 'body': body, 'fields': {}, 'requires': [],
                 'before': {path: (self.board / path).read_text()}, 'writes': {path: body}, 'deletes': []}
 
+    def test_resolution_status_persists_and_acknowledgement_removes_it(self):
+        self.request('/api/changes', self.change())
+        version = self.server.inbox.state()['version']
+        self.request('/api/change-status', {'id': 'one', 'reason': 'Choose which title to keep'})
+        reopened = serve.Inbox(self.view, self.board)
+        state = reopened.state()
+        self.assertEqual(state['version'], version)
+        self.assertEqual(state['queue'][0]['status'], 'Needs resolution')
+        self.assertEqual(state['queue'][0]['reason'], 'Choose which title to keep')
+        self.request('/api/change-status', {'id': 'one', 'reason': ''})
+        self.assertEqual(reopened.state()['queue'][0]['status'], 'Queued for agent')
+        self.request('/api/applied', {'ids': ['one']})
+        self.assertEqual(reopened.state()['queue'], [])
+        with self.assertRaises(HTTPError):
+            self.request('/api/change-status', {'id': 'one', 'reason': 'Too late'})
+
     def test_large_post_retry_and_restart(self):
         event = self.change(body='x' * 30000)
         self.assertEqual(self.request('/api/changes', event), {'queued': 'one'})

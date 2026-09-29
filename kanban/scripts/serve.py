@@ -72,6 +72,9 @@ class Inbox:
                     payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS reservations (id TEXT PRIMARY KEY, card INTEGER UNIQUE NOT NULL);
             ''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(changes)')}
+            if 'reason' not in columns:
+                db.execute("ALTER TABLE changes ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def connect(self):
@@ -87,7 +90,10 @@ class Inbox:
         files, stats = board_files(self.board)
         with self.connect() as db:
             applied = [row[0] for row in db.execute('SELECT id FROM changes WHERE applied = 1 ORDER BY seq')]
-        return {'version': version_of(files), 'boardId': hashlib.sha256(str(self.board).encode()).hexdigest()[:16],
+            queue = [{'id': row[0], 'summary': json.loads(row[1]).get('summary', 'Board change'),
+                      'status': 'Needs resolution' if row[2] else 'Queued for agent', 'reason': row[2]}
+                     for row in db.execute('SELECT id, payload, reason FROM changes WHERE applied = 0 ORDER BY seq')]
+        return {'queue': queue, 'version': version_of(files), 'boardId': hashlib.sha256(str(self.board).encode()).hexdigest()[:16],
                 'files': files, 'stats': stats, 'applied': applied}
 
     def pending(self):
@@ -168,6 +174,14 @@ class Inbox:
                 'paths_match': not changed and not blocked, 'changed_paths': changed,
                 'blocked_by': blocked, 'already_written': written and not blocked}
 
+    def report(self, event_id, reason):
+        if not isinstance(reason, str) or len(reason) > 2000:
+            raise ValueError('A resolution reason must be text of at most 2000 characters')
+        with self.lock, self.connect() as db:
+            result = db.execute('UPDATE changes SET reason = ? WHERE id = ? AND applied = 0', (reason, event_id))
+            if not result.rowcount:
+                raise ValueError('Unknown or already applied change')
+
     def acknowledge(self, ids):
         if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
             raise ValueError('Expected a list of applied change ids')
@@ -244,6 +258,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(200, {'card': self.server.inbox.reserve(data['id'])})
             if path == '/api/check-change':
                 return self.json_response(200, self.server.inbox.check(data['id']))
+            if path == '/api/change-status':
+                self.server.inbox.report(data['id'], data['reason'])
+                return self.json_response(200, {'id': data['id']})
             if path == '/api/applied':
                 self.server.inbox.acknowledge(data['ids'])
                 return self.json_response(200, {'applied': data['ids']})

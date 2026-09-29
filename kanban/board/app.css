@@ -267,3 +267,8 @@ body { background: var(--background); color: var(--foreground); }
 .kb-incoming-actions .btn { width: auto; }
 
 .kb-delivery-error { padding: .75rem 1.25rem; background: var(--muted); border-bottom: 1px solid var(--border); font-size: .875rem; }
+
+.kb-change-status { padding: 0 1.5rem; font-size: .8rem; color: var(--muted-foreground); max-height: 8rem; overflow: auto; }
+.kb-change-status:empty { display: none; }
+#schema-notice .btn, #migration-review .btn { margin: .5rem .5rem .5rem 0; }
+#schema-notice, #migration-review, .kb-settings-incoming { max-height: 45vh; overflow: auto; }

@@ -186,7 +186,7 @@
     eq('the before snapshot is the original file', c.before['todo/001-first-card.md'], files['todo/001-first-card.md']);
     await settled();
     check('the card shows as pending', document.querySelector('.kb-tile[data-id="1"]').classList.contains('kb-pending'));
-    has('and the top bar counts it', document.querySelector('.kb-topbar').textContent, '1 waiting for the agent');
+    has('and the top bar counts it', document.querySelector('.kb-topbar').textContent, '1 pending changes');
     check('the modal shows the saved card', document.getElementById('modal-title').textContent === 'First card, edited');
 
     // Deleting asks twice: the ticket must be typed before the red button works.
@@ -266,10 +266,14 @@
     k.state.settings.draft.name = 'My settings draft';
     const remoteConfig = { ...data, version: 'remote-config', files: { ...files, 'board.yml': files['board.yml'].replace('name: Demo', 'name: Remote') } };
     k.accept(remoteConfig);
+    check('incoming settings disable Save until resolved', document.querySelector('[data-action="settings-save"]').disabled);
+    const incomingSettings = document.querySelector('.kb-settings-incoming');
+    check('incoming settings show a decision notice', Boolean(incomingSettings));
+    [...incomingSettings.querySelectorAll('button')].find(b => b.textContent === 'Decline').click();
     document.querySelector('[data-action="settings-save"]').click();
     await settled();
     const settingsEdit = sent[sent.length - 1];
-    eq('settings changes preserve the editor original snapshot', settingsEdit.before['board.yml'], files['board.yml']);
+    eq('resolved settings use the explicitly reviewed snapshot', settingsEdit.before['board.yml'], remoteConfig.files['board.yml']);
     eq('settings changes use JSON POST without a card number', [settingsEdit.op, settingsEdit.card], ['config', undefined]);
 
     k.state.pending = [];
@@ -365,6 +369,110 @@
     check('large payloads are sent in the body, not URL', fetched[fetched.length - 1].url.length < 200 && fetched[fetched.length - 1].opts.body.length > 60000);
     k.state.pending = [];
     k.accept(data);
+    // Settings migrations require a review and update the cards with the settings.
+    k.state.pending = []; k.accept(data); sessionStorage.clear();
+    k.openSettings('fields');
+    const originalType = k.state.settings.draft.fields.find(f => f.name === 'type');
+    originalType.options = originalType.options.filter(o => o.value !== first.meta.type);
+    document.querySelector('[data-action="settings-save"]').click();
+    check('removing an in-use option opens a migration review', Boolean(document.querySelector('#migration-review')));
+    eq('reviewing a migration has not queued a change', k.state.pending.length, 0);
+    for (const input of document.querySelectorAll('[data-migration]')) input.value = originalType.options[0].value;
+    document.querySelector('[data-action="settings-save"]').click();
+    await settled();
+    eq('the reviewed option migration updates the card', k.state.board.cards.get(1).meta.type, originalType.options[0].value);
+    check('migration and settings are delivered as one event', k.state.pending.length === 1 && k.state.pending[0].migrations.length > 0 && Boolean(k.state.pending[0].writes['board.yml']) && Boolean(k.state.pending[0].writes[first.path]));
+    const migrationEvent = k.state.pending[0];
+    let staleMigration = false;
+    const changedCard = k.applyChange(files, { op: 'save', card: 1, title: first.title, body: first.body, fields: { type: 'elsewhere' } });
+    try { k.applyChange(changedCard, migrationEvent); } catch { staleMigration = true; }
+    check('migration replay refuses to overwrite a changed card value', staleMigration);
+
+    k.state.pending = []; k.accept(data); sessionStorage.clear();
+    k.openSettings('fields');
+    k.state.settings.draft.fields = k.state.settings.draft.fields.filter(f => f.name !== 'roles');
+    document.querySelector('[data-action="settings-save"]').click();
+    document.querySelector('[data-action="settings-save"]').click();
+    check('field removal needs explicit per-card confirmation', document.querySelector('#migration-review [role="alert"]').textContent.includes('Confirm removal'));
+    [...document.querySelectorAll('#migration-review button')].find(b => b.textContent === 'Preserve roles').click();
+    document.querySelector('[data-action="settings-save"]').click();
+    eq('preserving the field leaves card values intact', k.state.board.cards.get(1).meta.roles, first.meta.roles);
+    await settled();
+
+    k.state.pending = []; k.accept(data); sessionStorage.clear(); k.openSettings('fields');
+    k.state.settings.draft.fields.find(f => f.name === 'type').kind = 'number';
+    document.querySelector('[data-action="settings-save"]').click();
+    document.querySelector('[data-action="settings-save"]').click();
+    has('type migration rejects an invalid numeric conversion', document.querySelector('#migration-review [role="alert"]').textContent, 'valid number');
+    for (const input of document.querySelectorAll('[data-migration]')) input.value = '42';
+    document.querySelector('[data-action="settings-save"]').click(); await settled();
+    eq('explicit type migration writes a numeric value', k.state.board.cards.get(1).meta.type, 42);
+
+    k.state.pending = []; k.accept(data); sessionStorage.clear(); k.openSettings();
+    setVal(document.querySelector('[data-bind="name"]'), 'Keep my name');
+    const incomingTemplate = { ...data, version: 'incoming-template', files: { ...files, 'board.yml': files['board.yml'].replace('Describe the card.', 'Incoming template text.') } };
+    k.accept(incomingTemplate);
+    [...document.querySelectorAll('.kb-settings-incoming button')].find(b => b.textContent === 'Accept').click();
+    eq('accepting incoming template preserves independent settings typing', k.state.settings.draft.name, 'Keep my name');
+    has('accepting incoming template updates only that setting', k.state.settings.draft.template, 'Incoming template text.');
+    const closeConfirm = window.confirm; window.confirm = () => true;
+    document.querySelector('#modal [data-action="close"]').click(); await settled(); window.confirm = closeConfirm;
+
+    // Unknown choices remain selectable when an older board already contains them.
+    k.state.pending = [];
+    const legacy = { ...data, version: 'legacy-option', files: k.applyChange(files, { op: 'save', card: 1, title: first.title, body: first.body, fields: { type: 'legacy' } }) };
+    k.accept(legacy); sessionStorage.clear(); k.openCard(1, true);
+    eq('an unknown select value is preserved in the editor', document.querySelector('[name="type"]').value, 'legacy');
+    document.querySelector('#card-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    eq('saving an unknown option retains it', k.state.board.cards.get(1).meta.type, 'legacy');
+    await settled();
+
+    // Unsaved card and settings drafts restore without becoming queued changes.
+    k.state.pending = []; k.accept(data); sessionStorage.clear(); k.openCard(1, true);
+    setVal(document.querySelector('[name="title"]'), 'Unsaved draft title');
+    const savedDraft = Object.keys(sessionStorage).find(key => key.includes(':draft:card:1'));
+    check('typing persists the unsaved card draft', Boolean(savedDraft));
+    const originalConfirm = window.confirm;
+    window.confirm = () => false;
+    document.querySelector('#modal [data-action="close"]').click();
+    check('declining discard keeps the draft open', document.querySelector('#modal').open);
+    document.querySelector('#modal').dispatchEvent(new Event('cancel', { cancelable: true }));
+    check('Escape also asks before discarding the draft', document.querySelector('#modal').open);
+    k.openCard(1, true);
+    eq('reopening restores unsaved card text', document.querySelector('[name="title"]').value, 'Unsaved draft title');
+    window.confirm = () => true;
+    document.querySelector('#modal [data-action="close"]').click();
+    check('confirmed discard removes the saved draft', !sessionStorage.getItem(savedDraft));
+    await settled();
+    window.confirm = originalConfirm;
+    k.openSettings(); setVal(document.querySelector('[data-bind="name"]'), 'Unsaved board name');
+    k.openSettings();
+    eq('settings draft restores on reopening', document.querySelector('[data-bind="name"]').value, 'Unsaved board name');
+    window.confirm = () => true; document.querySelector('#modal [data-action="close"]').click(); await settled(); window.confirm = originalConfirm;
+
+    // An open editor cannot submit with controls from an obsolete schema.
+    k.accept(data); sessionStorage.clear(); k.openCard(1, true);
+    setVal(document.querySelector('[name="title"]'), 'Retain while schema changes');
+    const schemaFiles = { ...files, 'board.yml': files['board.yml'].replace('label: Type', 'label: Changed type') };
+    k.accept({ ...data, version: 'schema-changed', files: schemaFiles });
+    check('schema change blocks stale card submission', document.querySelector('[form="card-form"][type="submit"]').disabled);
+    document.querySelector('#schema-notice button').click();
+    eq('schema review retains typed text', document.querySelector('[name="title"]').value, 'Retain while schema changes');
+    check('schema review uses the updated controls', document.querySelector('#card-form').textContent.includes('Changed type'));
+    window.confirm = () => true; document.querySelector('#modal [data-action="close"]').click(); await settled(); window.confirm = originalConfirm;
+
+    // Poll failures and server resolution states are visible even without board changes.
+    k.accept(data);
+    const appendPoll = document.head.append;
+    document.head.append = script => script.onerror(); k.poll(); document.head.append = appendPoll;
+    has('failed polling announces stale board data', document.querySelector('.kb-app').textContent, 'Connection lost');
+    window.KANBAN_DATA = { ...data, queue: [{ id: 'remote-pending', summary: 'Remote edit', status: 'Needs resolution', reason: 'Choose the intended title' }] };
+    document.head.append = script => script.onload(); k.poll(); document.head.append = appendPoll;
+    check('successful polling clears the connection warning', !k.state.connectionError);
+    has('status-only polling shows resolution details', document.querySelector('.kb-change-status').textContent, 'Needs resolution');
+    has('resolution reason is visible', document.querySelector('.kb-change-status').textContent, 'Choose the intended title');
+    k.accept(data); window.KANBAN_DATA = data;
+
     window.fetch = realFetch;
   }
 

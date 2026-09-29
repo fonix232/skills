@@ -32,6 +32,10 @@ Each card is Markdown with its fields in YAML front matter. `board.yml` defines 
 - Deleting takes two steps: the red Delete, then typing the ticket to confirm.
 - **Board** edits `board.yml` visually: the columns and their order, the fields (kind, tile, border colour, help, and a select's options with labels and colours picked from the theme's palette) and the new-card template.
 - The page sends JSON POST requests to a durable inbox. The agent checks fresh files, merges the changes and acknowledges application. Failed deliveries remain visible for retry. Incoming changes in an open editor have per-field Accept/Decline notices; the page never overwrites typing automatically.
+- Settings changes that affect existing card values require a migration review. Keep the original field, choose replacement values, or explicitly confirm removals; settings and migrations travel together.
+- Incoming settings have Accept/Decline notices. Open card editors retain typing while the user reviews a changed schema.
+- Unsaved card and settings drafts survive reloads in the same browser tab. Reopen the editor to restore them; closing it asks before discarding. Closing the tab can clear these browser drafts.
+- Connection loss is visible. Changes show Not delivered, Queued for agent, Needs resolution (with the agent's reason), or Applied.
 - Ticket numbers are reserved centrally, and acknowledgements clear pending edits even if the final board content is unchanged. Existing log-based sessions must be reconciled before switching; see `SKILL.md`.
 
 The templates are `board/templates/`:

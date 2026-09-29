@@ -13,8 +13,8 @@ KanbanTemplates.dashboard = /*html*/ `
       <h1 class="text-lg font-semibold truncate">{{name}}</h1>
       <span class="badge" data-variant="outline">{{key}}</span>
       {{#pending.count}}
-      <span class="badge" data-variant="secondary" title="{{#pending.list}}{{summary}}&#10;{{/pending.list}}">
-        {{pending.count}} waiting for the agent
+      <span class="badge" data-variant="secondary" title="{{#pending.list}}{{status}}: {{summary}}&#10;{{/pending.list}}">
+        {{pending.count}} pending changes
       </span>
       {{/pending.count}}
       {{^editable}}
@@ -37,6 +37,11 @@ KanbanTemplates.dashboard = /*html*/ `
   {{/deliveryError}}
   {{#storageError}}<div class="kb-delivery-error" role="status">{{storageError}}</div>{{/storageError}}
   {{#replayError}}<div class="kb-delivery-error" role="alert">{{replayError}}</div>{{/replayError}}
+  {{#connectionError}}<div class="kb-delivery-error" role="alert">{{connectionError}}</div>{{/connectionError}}
+  <div class="kb-change-status" role="status">
+    {{#pending.list}}<div><strong>{{status}}</strong>: {{summary}}</div>{{/pending.list}}
+    {{#lastApplied}}<div>Applied: {{lastApplied}} changes this session</div>{{/lastApplied}}
+  </div>
   <main class="kb-board">
     {{#columns}}
     <section class="kb-column" data-column="{{id}}" aria-label="{{title}}">

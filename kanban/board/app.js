@@ -38,6 +38,8 @@
     deliveryError: '',
     storageError: '',
     sending: false,
+    connectionError: '',
+    lastApplied: 0,
   };
 
   // ---------------------------------------------------------------- the Markdown files
@@ -366,6 +368,14 @@
       const keeps = (col) => c.board.columns.some((x) => x.id === col.id);
       if (before.columns.some((col) => !keeps(col) && col.cards.length)) return;
       files['board.yml'] = serializeBoard(c.board);
+      for (const migration of c.migrations || []) {
+        const card = buildBoard(files).cards.get(migration.card);
+        if (!card || !sameValue(card.meta[migration.field], migration.before)) throw new Error('A card changed during migration. Resolve it before applying settings.');
+        const meta = { ...card.meta };
+        if (migration.remove) delete meta[migration.field];
+        else meta[migration.field] = migration.value;
+        files[card.path] = serializeCard(meta, card.body, keyOrder(c.board));
+      }
       const after = buildBoard(files);
       for (const col of after.columns) files[orderPath(col.id)] = orderText(col, col.cards, after.config.key);
       for (const col of before.columns) if (!keeps(col)) delete files[orderPath(col.id)];
@@ -469,6 +479,7 @@
       } catch { S.storageError = 'The saved browser outbox could not be read. Keep this page open and check the server inbox.'; }
     }
     const applied = new Set(data.applied || []);
+    S.lastApplied += S.pending.filter((c) => applied.has(c.id)).length;
     S.pending = S.pending.filter((c) => !applied.has(c.id));
     let files = { ...(data.files || {}) };
     S.replayError = '';
@@ -489,12 +500,24 @@
   }
 
   function poll() {
+    if (S.polling) return;
+    S.polling = true;
     const s = document.createElement('script');
     s.src = `data.js?t=${Date.now()}`;
-    s.onload = s.onerror = () => {
+    const timeout = setTimeout(() => failed(), 10000);
+    const failed = () => {
+      clearTimeout(timeout); s.remove(); S.polling = false; s.onload = s.onerror = null;
+      S.connectionError = 'Connection lost. The board may be out of date; your drafts are retained.';
+      render();
+    };
+    s.onerror = failed;
+    s.onload = () => {
+      clearTimeout(timeout); S.polling = false;
+      S.connectionError = '';
       s.remove();
       const d = window.KANBAN_DATA;
-      if (d && (d.version !== S.data?.version || JSON.stringify(d.applied || []) !== JSON.stringify(S.data?.applied || []))) accept(d);
+      if (d && (d.version !== S.data?.version || JSON.stringify(d.applied || []) !== JSON.stringify(S.data?.applied || []) || JSON.stringify(d.queue || []) !== JSON.stringify(S.data?.queue || []))) accept(d);
+      else render();
     };
     document.head.append(s);
   }
@@ -568,15 +591,25 @@
       key: c.key,
       query: S.query,
       editable: LIVE,
-      pending: { count: S.pending.length, list: S.pending.map((p) => ({ summary: p.summary })) },
+      pending: { count: changeStatuses().length, list: changeStatuses() },
+      connectionError: S.connectionError, lastApplied: S.lastApplied,
       deliveryError: S.deliveryError, storageError: S.storageError, replayError: S.replayError,
       columns: S.board.columns.map((col) => ({ id: col.id, title: col.title, count: col.cards.length, cards: col.cards.map(tileView) })),
     };
   }
 
+  function changeStatuses() {
+    const queued = S.data?.queue || [];
+    const rows = new Map(queued.map(row => [row.id, { ...row, summary: row.reason ? `${row.summary}: ${row.reason}` : row.summary }]));
+    for (const event of S.pending) if (!rows.has(event.id)) rows.set(event.id, { summary: event.summary,
+      status: S.replayError ? 'Needs resolution' : S.delivery[event.id] === 'queued' ? 'Queued for agent' : 'Not delivered' });
+    return [...rows.values()];
+  }
+
   function fieldInputView(field, value) {
     const values = fieldValues(field, value);
-    const kind = field.kind;
+    const invalidTypedValue = !isEmpty(value) && ((field.kind === 'number' && !Number.isFinite(Number(value))) || (field.kind === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(String(value))));
+    const kind = invalidTypedValue ? 'text' : field.kind;
     const text = kind === 'cards' ? values.map(ticketOf).join(', ') : values.join(', ');
     return {
       name: field.name,
@@ -589,7 +622,7 @@
       isCards: kind === 'cards',
       isNumber: kind === 'number',
       isDate: kind === 'date',
-      options: field.options.map((o) => ({ value: o.value, label: o.label || o.value, selected: values.includes(o.value) })),
+      options: [...field.options, ...values.filter(v => !field.options.some(o => o.value === String(v))).map(v => ({ value: String(v), label: `${v} (existing value)` }))].map((o) => ({ value: o.value, label: o.label || o.value, selected: values.includes(o.value) })),
       text,
     };
   }
@@ -859,20 +892,26 @@
   }
 
   function openCard(id, editing = false) {
+    persistDraft();
     const card = S.board.cards.get(Number(id));
     if (!card) return;
-    S.modal = { kind: 'card', id: card.id, editing, seen: editing ? editorValues(card) : null, incoming: {} };
+    S.modal = { kind: 'card', id: card.id, editing, schema: structuredClone(S.board.config), seen: editing ? editorValues(card) : null, incoming: {} };
     showModal(Mustache.render(T.cardModal, cardView(card, editing), T.partials));
+    if (editing) restoreDraft();
     if (!editing && LIVE) bindTaskSortables($('#modal-body'), card.id);
   }
 
   function openNew(column) {
-    S.modal = { kind: 'new' };
+    persistDraft();
+    S.modal = { kind: 'new', schema: structuredClone(S.board.config) };
     showModal(Mustache.render(T.newCard, newCardView(column), T.partials));
+    restoreDraft();
     $('#f-title')?.focus();
   }
 
-  function closeModal() {
+  function closeModal(saved = false) {
+    if (!saved && S.modal?.dirty && !window.confirm('Discard this unsaved draft? Cancel keeps it open.')) return;
+    clearDraft();
     S.modal = null;
     $('#modal').close();
   }
@@ -940,7 +979,7 @@
       form.prepend(notice);
     }
     const save = $('[type="submit"][form="card-form"]');
-    if (save) save.disabled = S.modal.deleted || Object.keys(S.modal.incoming).length > 0;
+    if (save) save.disabled = S.modal.schemaChanged || S.modal.deleted || Object.keys(S.modal.incoming).length > 0;
   }
 
   function resolveIncoming(key, acceptValue) {
@@ -951,6 +990,12 @@
       const field = key.startsWith('field:') && S.board.config.fields.find((f) => f.name === key.slice(6));
       if (field?.kind === 'multiselect') {
         const selected = (Array.isArray(value) ? value : []).map(String);
+        for (const value of selected) if (![...$('#card-form').querySelectorAll(`[name="${CSS.escape(field.name)}"]`)].some(el => el.value === value)) {
+          const label = document.createElement('label');
+          const input = document.createElement('input'); input.type = 'checkbox'; input.name = field.name; input.value = value;
+          label.append(input, document.createTextNode(` ${value} (existing value)`));
+          (control.closest('.field') || control.parentElement).append(label);
+        }
         $('#card-form').querySelectorAll(`[name="${CSS.escape(field.name)}"]`).forEach((el) => { el.checked = selected.includes(el.value); });
       } else {
         const text = isEmpty(value) ? '' : Array.isArray(value)
@@ -966,10 +1011,13 @@
       }
     }
     delete S.modal.incoming[key];
+    S.modal.dirty = true; persistDraft();
     showIncoming();
   }
 
   function refreshModal() {
+    if (S.modal?.kind === 'settings') { refreshSettings(); return; }
+    if (S.modal?.schema && !sameValue(S.modal.schema, S.board.config)) showSchemaNotice();
     if (!S.modal || S.modal.kind !== 'card' || !$('#modal').open) return;
     const card = S.board.cards.get(S.modal.id);
     if (S.modal.editing) {
@@ -995,6 +1043,7 @@
   const TABS = ['general', 'columns', 'fields', 'template'];
 
   function openSettings(tab = 'general') {
+    persistDraft();
     const c = S.board.config;
     const counts = Object.fromEntries(S.board.columns.map((col) => [col.id, col.cards.length]));
     S.settings = {
@@ -1002,6 +1051,8 @@
       errors: [],
       palette: null,
       sourceFiles: { ...S.files },
+      incoming: {},
+      seenConfig: structuredClone(c),
       draft: {
         name: c.name,
         key: c.key,
@@ -1012,6 +1063,7 @@
     };
     S.modal = { kind: 'settings' };
     renderSettings();
+    restoreDraft();
   }
 
   function settingsView() {
@@ -1064,6 +1116,7 @@
           if (e.oldIndex === e.newIndex) return;
           reorder(list(), e.oldIndex, e.newIndex);
           S.settings.palette = null;
+          S.modal.dirty = true; persistDraft();
           renderSettings();
         },
       });
@@ -1071,6 +1124,7 @@
     document.querySelectorAll('#modal [data-list="fields"]').forEach((el) => sortable(el, () => S.settings.draft.fields));
     document.querySelectorAll('#modal [data-list="options"]').forEach((el) =>
       sortable(el, () => S.settings.draft.fields[Number(el.dataset.i)].options));
+    refreshSettings();
   }
 
   // Sets `path` ("fields.2.options.1.label") in the draft.
@@ -1109,6 +1163,7 @@
   }
 
   function saveSettings() {
+    if (Object.keys(S.settings.incoming || {}).length) return;
     const d = S.settings.draft;
     const errors = validateSettings(d);
     for (const col of S.board.columns) {
@@ -1131,10 +1186,12 @@
       })),
       template: d.template,
     };
+    const migrations = reviewMigrations(board);
+    if (migrations === null) return;
     const sourceFiles = S.settings.sourceFiles;
-    commit('config', { board }, 'Edit the board settings', sourceFiles);
+    commit('config', { board, migrations }, 'Edit the board settings', sourceFiles);
+    closeModal(true);
     S.settings = null;
-    closeModal();
   }
 
   function settingsAction(action, el) {
@@ -1178,38 +1235,230 @@
     renderSettings();
   }
 
+  // Drafts are per tab and board, like the outbox. Keep the schema that rendered the form.
+  const draftKey = () => `${outboxKey()}:draft:${S.modal?.kind}:${S.modal?.id || 'new'}`;
+  function formSnapshot() {
+    const form = $('#card-form') || $('#new-card-form');
+    return form ? [...form.elements].filter(e => e.name).map(e => ({ name: e.name, value: e.value, checked: e.checked, type: e.type })) : [];
+  }
+  function fillSnapshot(values) {
+    const form = $('#card-form') || $('#new-card-form');
+    if (!form) return;
+    for (const old of values || []) {
+      const controls = [...form.elements].filter(e => e.name === old.name);
+      for (const e of controls) {
+        if (e.type === 'checkbox' || e.type === 'radio') { if (e.value === old.value) e.checked = old.checked; }
+        else { if (['number', 'date'].includes(e.type)) e.type = 'text'; if (e.tagName === 'SELECT' && ![...e.options].some(o => o.value === old.value)) e.add(new Option(`${old.value} (draft value)`, old.value)); e.value = old.value; }
+      }
+    }
+  }
+  function persistDraft() {
+    if (!S.modal?.dirty) return;
+    try {
+      sessionStorage.setItem(draftKey(), JSON.stringify({ modal: S.modal, settings: S.settings, values: formSnapshot() }));
+    } catch { S.storageError = 'Draft storage is unavailable. Keep this page open until you save.'; }
+  }
+  function clearDraft() {
+    try { sessionStorage.removeItem(draftKey()); } catch {}
+    if (S.modal) S.modal.dirty = false;
+  }
+  function restoreDraft() {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(draftKey()) || 'null');
+      if (!saved) return;
+      S.modal = saved.modal;
+      if (saved.settings && S.modal.kind === 'settings') { S.settings = saved.settings; renderSettings(); }
+      else {
+        const current = S.board.config;
+        S.board.config = saved.modal.schema || current;
+        const card = S.board.cards.get(S.modal.id);
+        if (S.modal.kind === 'new') showModal(Mustache.render(T.newCard, newCardView(), T.partials));
+        else if (card) showModal(Mustache.render(T.cardModal, cardView(card, true), T.partials));
+        S.board.config = current;
+        fillSnapshot(saved.values);
+      }
+      const notice = document.createElement('p'); notice.className = 'kb-incoming';
+      notice.textContent = 'Unsaved draft restored. Save it or close to discard it.';
+      $('#modal-body').prepend(notice);
+      refreshModal();
+    } catch { S.storageError = 'The saved draft could not be restored. Its stored copy has been retained.'; }
+  }
+
+  function decisionNotice(label, value, resolve) {
+    const box = document.createElement('section'); box.className = 'kb-incoming'; box.setAttribute('role', 'status');
+    const title = document.createElement('strong'); title.textContent = label;
+    const preview = document.createElement('pre'); preview.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    const actions = document.createElement('div'); actions.className = 'kb-incoming-actions';
+    for (const choice of ['Accept', 'Decline']) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'btn'; button.textContent = choice;
+      button.addEventListener('click', () => resolve(choice === 'Accept'));
+      actions.append(button);
+    }
+    box.append(title, preview, actions); return box;
+  }
+  function refreshSettings() {
+    const st = S.settings;
+    if (!st) return;
+    const current = S.board.config;
+    for (const key of ['name', 'key', 'columns', 'fields', 'template']) {
+      if (!sameValue(current[key], st.seenConfig[key])) st.incoming[key] = structuredClone(current[key]);
+    }
+    st.seenConfig = structuredClone(current);
+    $('#modal-body').querySelectorAll('.kb-settings-incoming').forEach(e => e.remove());
+    for (const [key, value] of Object.entries(st.incoming)) {
+      const box = decisionNotice(`Incoming settings: ${key}`, value, accept => {
+        if (accept) {
+          st.draft[key] = structuredClone(value);
+          if (key === 'fields') st.draft.fields.forEach(f => { f.existing = true; });
+          if (key === 'columns') st.draft.columns.forEach(c => { c.existing = true; c.count = S.board.columns.find(col => col.id === c.id)?.cards.length || 0; });
+        }
+        delete st.incoming[key];
+        if (!Object.keys(st.incoming).length) st.sourceFiles = { ...S.files };
+        S.modal.dirty = true;
+        renderSettings(); refreshSettings(); persistDraft();
+      });
+      box.classList.add('kb-settings-incoming');
+      ($('#modal .kb-modal-body') || $('#modal-body')).prepend(box);
+    }
+    const save = $('[data-action="settings-save"]');
+    if (save) save.disabled = Boolean(Object.keys(st.incoming).length);
+  }
+  function showSchemaNotice() {
+    S.modal.schemaChanged = true;
+    if ($('#schema-notice')) return;
+    const box = document.createElement('section'); box.id = 'schema-notice'; box.className = 'kb-incoming';
+    box.textContent = 'Board fields or columns changed while this draft was open. Reload the editor to use the new settings; your text will be retained. Removed fields remain in the saved draft until resolved.';
+    const button = document.createElement('button'); button.className = 'btn'; button.type = 'button'; button.textContent = 'Review updated fields';
+    button.onclick = () => {
+      const values = formSnapshot(), old = S.modal, original = readFields($('#card-form') || $('#new-card-form')).fields;
+      clearDraft();
+      if (old.kind === 'new') openNew(); else openCard(old.id, true);
+      fillSnapshot(values);
+      S.modal.dirty = true;
+      // Retain controls that disappeared until the user explicitly keeps or discards their values.
+      const form = $('#card-form') || $('#new-card-form');
+      const removed = values.filter(v => ![...form.elements].some(e => e.name === v.name));
+      S.modal.orphaned = old.orphaned || {};
+      for (const v of removed) S.modal.orphaned[v.name] = original[v.name];
+      persistDraft();
+      const info = document.createElement('p'); info.className = 'kb-incoming';
+      info.textContent = 'Draft retained. Review the updated fields before saving. Values for removed fields are preserved on the card.';
+      $('#modal-body').prepend(info);
+    };
+    box.append(button); ($('#modal .kb-modal-body') || $('#modal-body')).prepend(box);
+    const submit = $('[type="submit"][form="card-form"]') || $('[type="submit"][form="new-card-form"]');
+    if (submit) submit.disabled = true;
+  }
+
+  function migrationValue(field, text) {
+    if (!field) return undefined;
+    if (field.kind === 'multiselect' || field.kind === 'list') return text.split(',').map(v => v.trim()).filter(Boolean);
+    if (field.kind === 'cards') {
+      if (!/^\s*(?:\d+(?:\s*,\s*\d+)*)?\s*$/.test(text)) throw new Error('Use comma-separated ticket numbers.');
+      return text.trim() ? text.split(',').map(Number) : [];
+    }
+    if (field.kind === 'number') { if (!text.trim() || !Number.isFinite(Number(text))) throw new Error('Enter a valid number.'); return Number(text); }
+    if (field.kind === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error('Use a date in YYYY-MM-DD format.');
+    return text;
+  }
+  function reviewMigrations(board) {
+    const rows = [];
+    for (const previous of S.board.config.fields) {
+      const field = board.fields.find(f => f.name === previous.name);
+      for (const card of S.board.cards.values()) {
+        const value = card.meta[previous.name];
+        if (isEmpty(value)) continue;
+        const invalidOption = field && ['select', 'multiselect'].includes(field.kind) && (Array.isArray(value) ? value : [value]).some(v => !field.options.some(o => String(o.value) === String(v)));
+        if (!field || field.kind !== previous.kind || (invalidOption && !sameValue(previous.options, field.options))) rows.push({ card: card.id, field: previous.name, before: value, target: field });
+      }
+    }
+    if (!rows.length) return [];
+    const signature = JSON.stringify({ board, rows });
+    const oldPanel = $('#migration-review');
+    if (oldPanel?.dataset.signature === signature) {
+      const migrations = [];
+      try {
+        rows.forEach((row, i) => {
+          const control = oldPanel.querySelector(`[data-migration="${i}"]`);
+          if (!row.target && !control.checked) throw new Error('Confirm removal for each affected card, or preserve its field.');
+          const value = row.target ? migrationValue(row.target, control.value) : undefined;
+          if (row.target && ['select', 'multiselect'].includes(row.target.kind) && (Array.isArray(value) ? value : [value]).some(v => !row.target.options.some(o => o.value === v))) throw new Error('Choose values from the new options.');
+          migrations.push({ card: row.card, field: row.field, before: row.before, value, remove: !row.target });
+        });
+      } catch (error) { oldPanel.querySelector('[role="alert"]').textContent = error.message; return null; }
+      return migrations;
+    }
+    oldPanel?.remove();
+    const panel = document.createElement('section'); panel.id = 'migration-review'; panel.className = 'kb-incoming'; panel.dataset.signature = signature;
+    const title = document.createElement('h3'); title.textContent = 'Review affected cards before saving'; panel.append(title);
+    const help = document.createElement('p'); help.textContent = 'Choose replacement values, confirm removals, or preserve the original field. Save again to apply settings and these migrations together.'; panel.append(help);
+    const error = document.createElement('p'); error.setAttribute('role', 'alert'); panel.append(error);
+    rows.forEach((row, i) => {
+      const label = document.createElement('label'); label.className = 'field'; label.textContent = `${ticketOf(row.card)} · ${row.field}: ${JSON.stringify(row.before)} → `;
+      const input = document.createElement('input'); input.dataset.migration = i;
+      input.type = row.target ? 'text' : 'checkbox';
+      if (row.target) { input.value = Array.isArray(row.before) ? row.before.join(', ') : String(row.before); input.setAttribute('aria-label', `${ticketOf(row.card)} ${row.field} replacement`); }
+      else input.setAttribute('aria-label', `Remove ${row.field} from ${ticketOf(row.card)}`);
+      label.append(input);
+      if (row.target?.options.length) label.append(document.createTextNode(` Options: ${row.target.options.map(o => o.value).join(', ')}`));
+      panel.append(label);
+    });
+    for (const name of new Set(rows.map(r => r.field))) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'btn'; button.textContent = `Preserve ${name}`;
+      button.onclick = () => {
+        const field = structuredClone(S.board.config.fields.find(f => f.name === name)); field.existing = true;
+        const index = S.settings.draft.fields.findIndex(f => f.name === name);
+        if (index < 0) S.settings.draft.fields.push(field); else S.settings.draft.fields[index] = field;
+        S.modal.dirty = true; persistDraft(); renderSettings(); refreshSettings();
+      }; panel.append(button);
+    }
+    ($('#modal .kb-modal-body') || $('#modal-body')).prepend(panel); return null;
+  }
+
   // ---------------------------------------------------------------- forms
 
   function readFields(form) {
     const data = new FormData(form);
-    const out = {};
-    for (const f of S.board.config.fields) {
+    const out = { ...(S.modal?.orphaned || {}) };
+    for (const f of (S.modal?.schema || S.board.config).fields) {
       if (f.kind === 'multiselect') out[f.name] = data.getAll(f.name).map(String);
       else {
         const raw = String(data.get(f.name) ?? '').trim();
         if (f.kind === 'list') out[f.name] = raw.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
         else if (f.kind === 'cards') out[f.name] = [...raw.matchAll(/\d+/g)].map((m) => Number(m[0]));
-        else if (f.kind === 'number') out[f.name] = raw === '' ? null : Number(raw);
+        else if (f.kind === 'number') {
+          const original = S.board.cards.get(S.modal?.id)?.meta[f.name];
+          out[f.name] = raw === String(original) ? original : raw === '' ? null : Number(raw);
+        }
         else out[f.name] = raw;
       }
     }
     return { title: String(data.get('title') || '').trim(), column: String(data.get('column') || ''), body: String(data.get('body') || ''), fields: out };
   }
 
+  function validateFormFields(form, fields) {
+    form.querySelector('.kb-value-error')?.remove();
+    const invalid = Object.entries(fields).find(([, value]) => typeof value === 'number' && !Number.isFinite(value));
+    if (!invalid) return true;
+    const error = document.createElement('p'); error.className = 'kb-incoming kb-value-error'; error.setAttribute('role', 'alert');
+    error.textContent = `${invalid[0]} needs a valid number.`; form.prepend(error); return false;
+  }
+
   function saveCard(form) {
-    if (S.modal?.deleted || Object.keys(S.modal?.incoming || {}).length) return;
+    if (S.modal?.schemaChanged || S.modal?.deleted || Object.keys(S.modal?.incoming || {}).length) return;
     const id = Number(form.dataset.id);
     const { title, column, body, fields } = readFields(form);
-    if (!title) return;
+    if (!title || !validateFormFields(form, fields)) return;
+    clearDraft();
     S.modal = { kind: 'card', id, editing: false };
     commit('save', { card: id, title, column, fields, body }, `Edit ${ticketOf(id)}: ${title}`);
     openCard(id);
   }
 
   async function createCard(form) {
-    if (form.dataset.submitting) return;
+    if (form.dataset.submitting || S.modal?.schemaChanged) return;
     const { title, column, body, fields } = readFields(form);
-    if (!title) return;
+    if (!title || !validateFormFields(form, fields)) return;
     form.dataset.submitting = 'true';
     // Reuse the reservation on retry, even if the response was lost after allocation.
     const requestId = form.dataset.requestId || (form.dataset.requestId = uid());
@@ -1221,7 +1470,7 @@
       const created = new Date().toISOString().slice(0, 10);
       const col = S.board.columns.find((c) => c.id === column);
       commit('create', { id: requestId, card: id, title, column, fields, body, created }, `New card ${ticketOf(id)} in ${col ? col.title : column}: ${title}`);
-      if ($('#new-card-form') === form) closeModal();
+      if ($('#new-card-form') === form) closeModal(true);
     } catch (error) {
       let notice = $('.kb-create-error', form);
       if (!notice) {
@@ -1265,8 +1514,10 @@
     if (action === 'filter' || (action === 'toggle-task' && e.target !== el)) return;
     if (el.tagName === 'A' || el.tagName === 'BUTTON') e.preventDefault();
     if (action.startsWith('settings')) {
+      if (S.modal) S.modal.dirty = true;
       if (action === 'settings') openSettings();
       else if (S.settings) settingsAction(action, el);
+      persistDraft();
       return;
     }
     switch (action) {
@@ -1331,10 +1582,18 @@
     if (!bind || !S.settings) return false;
     const value = e.target.type === 'checkbox' ? e.target.checked : e.target.value;
     setPath(S.settings.draft, bind, bind === 'key' ? value.toUpperCase() : value);
+    S.modal.dirty = true;
+    persistDraft();
     if (e.type === 'change' && bind.endsWith('.kind')) renderSettings();
     return true;
   }
   document.addEventListener('change', bindSetting);
+  for (const name of ['input', 'change']) document.addEventListener(name, event => {
+    if (event.target.closest('#modal') && (S.modal?.editing || S.modal?.kind === 'new')) {
+      S.modal.dirty = true; persistDraft();
+    }
+  });
+  $('#modal').addEventListener('cancel', event => { event.preventDefault(); closeModal(); });
 
   document.addEventListener('input', (e) => {
     if (bindSetting(e)) return;
@@ -1372,7 +1631,8 @@
   }
   window.addEventListener('hashchange', followHash);
   window.addEventListener('beforeunload', (event) => {
-    if (S.pending.some((c) => S.delivery[c.id] !== 'queued')) { event.preventDefault(); event.returnValue = ''; }
+    persistDraft();
+    if (S.modal?.dirty || S.pending.some((c) => S.delivery[c.id] !== 'queued')) { event.preventDefault(); event.returnValue = ''; }
   });
 
   if (window.KANBAN_DATA) accept(window.KANBAN_DATA);

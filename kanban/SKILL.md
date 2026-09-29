@@ -131,7 +131,8 @@ curl -fsS http://127.0.0.1:8124/api/changes
 The page sends `POST /api/changes` with a JSON body. The server acknowledges it only after
 committing it to `.ai/local/kanban/inbox.sqlite3`; retries with the same change ID are
 idempotent. Changes remain pending until the agent explicitly acknowledges application.
-Delivery failures show a Retry button; the browser retains pending changes across reloads
+The page distinguishes Not delivered, Queued for agent, Needs resolution and Applied.
+A failed poll shows that the board may be out of date. Delivery failures show a Retry button; the browser retains pending changes across reloads
 when storage is available. The request limit is 8 MiB; oversized changes show an error.
 Do not delete or truncate the inbox. `server.log` is diagnostic output, never a queue.
 Poll the inbox periodically while assisting the user; no special Monitor tool is required.
@@ -166,10 +167,16 @@ curl -fsS -H 'Content-Type: application/json' \
   contents, and the actual contents. Never treat an old injected version or the batch's
   initial comparison as proof that later writes are safe. For checklist changes, identify
   the original item by its text/context; a changed index alone is not enough.
+- A `config` event may include `migrations`: explicit per-card field replacements or removals,
+  with original values in `before`. Apply these together with the settings, preserving any
+  independent card edits. A stale migration value needs resolution, never blind replacement.
 - For `config`, compare against the settings editor's original `board.yml` snapshot and
   keep unrelated configuration changes. Never remove a column that now contains cards.
 - Preserve independent edits. Leave ambiguous conflicts pending and explain them to the
-  user; do not acknowledge or apply dependent events until resolved.
+  user; do not acknowledge or apply dependent events until resolved. Report the reason to
+  `POST /api/change-status` as `{"id":"CHANGE_ID","reason":"What needs a decision"}`.
+  This makes the pending event visibly **Needs resolution**. Send an empty `reason` after
+  resolution to return it to **Queued for agent**, or acknowledge it after verified application.
 
 Creating cards reserves an ID through `POST /api/reserve-id` with `{"id":"UNIQUE_REQUEST_ID"}`.
 The server serializes reservations and takes the maximum across current card IDs, stored
@@ -201,6 +208,17 @@ Do not use a broad `pkill` pattern or remove the inbox when stopping.
 with the previous client before switching servers. Keep `server.log` and `applied.json`
 until reconciled; the new inbox does not automatically import old GET events. Stop the
 old server before starting the POST server on the same port, then reload the dashboard.
+
+Settings edits that remove populated fields, change field types or remove used options
+require a migration review. Users can choose replacement values, explicitly confirm removals,
+or preserve the original field. Existing unknown option values remain editable and are
+preserved on ordinary card saves. Incoming settings show Accept/Decline notices; an open
+card editor must review a changed schema before saving.
+
+Unsaved card, new-card and settings drafts are retained in browser session storage per tab
+and board. Reopening the editor restores its draft; closing asks before discarding it.
+Reloading preserves drafts, but closing the browser tab can clear session storage. Drafts
+are separate from the server's durable inbox and are not instructions to edit board files.
 
 ## Setting up a board
 
