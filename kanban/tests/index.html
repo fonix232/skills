@@ -1,0 +1,60 @@
+<!doctype html>
+<!--
+  The board's tests, in the browser. Serve the repository's root and open this page, for
+  example headless (see README.md, "Tests"): the title ends up "PASS <n>" or "FAIL <n>", and
+  #results lists every check.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Running</title>
+  <link rel="stylesheet" href="../board/vendor/basecoat.cdn.min.css">
+  <script>
+    window.KANBAN_STAMP = Date.now().toString(36);
+    document.write(`<link rel="stylesheet" href="../board/app.css?v=${window.KANBAN_STAMP}">`);
+  </script>
+  <script src="../board/vendor/tailwindcss-browser.js"></script>
+  <script>window.KanbanTemplates = { partials: {} };</script>
+</head>
+<body>
+  <div id="app"></div>
+  <dialog id="modal" class="dialog kb-modal" aria-labelledby="modal-title"><div id="modal-body"></div></dialog>
+  <dialog id="confirm" class="dialog" aria-label="Confirm"></dialog>
+  <pre id="results"></pre>
+  <!--
+    The scripts load one after another: Python's static server, which serves the board, takes
+    only a few connections at a time. A script that fails to load is tried again.
+  -->
+  <script>
+    (function load(scripts, i, tries) {
+      if (i === scripts.length) return;
+      const [src, optional] = scripts[i];
+      const s = document.createElement('script');
+      s.src = src.includes('vendor/') ? src : `${src}?v=${window.KANBAN_STAMP}`;
+      s.onload = () => load(scripts, i + 1, 0);
+      s.onerror = () => {
+        s.remove();
+        if (tries < (optional ? 1 : 5)) setTimeout(() => load(scripts, i, tries + 1), 250 * (tries + 1));
+        else if (optional) load(scripts, i + 1, 0);
+        else console.error(`kanban: couldn't load ${src}`);
+      };
+      document.body.append(s);
+    })([
+      ['../board/vendor/basecoat.min.js', false],
+      ['../board/vendor/Sortable.min.js', false],
+      ['../board/vendor/mustache.min.js', false],
+      ['../board/vendor/marked.umd.js', false],
+      ['../board/vendor/purify.min.js', false],
+      ['../board/vendor/js-yaml.min.js', false],
+      ['../board/templates/dashboard.js', false],
+      ['../board/templates/card-modal.js', false],
+      ['../board/templates/new-card.js', false],
+      ['../board/templates/fields.js', false],
+      ['../board/templates/settings.js', false],
+      ['fixture.js', false],
+      ['../board/app.js', false],
+      ['tests.js', false]
+    ], 0, 0);
+  </script>
+</body>
+</html>

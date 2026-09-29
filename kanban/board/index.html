@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kanban</title>
+  <!-- The theme follows the system until the toggle picks one. -->
+  <script>
+    try {
+      const theme = localStorage.getItem('kanban-theme');
+      const dark = theme ? theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.classList.toggle('dark', dark);
+    } catch {}
+  </script>
+  <link rel="stylesheet" href="vendor/basecoat.cdn.min.css">
+  <!--
+    The page's own files load with a per-load stamp: Python's static server sends no cache
+    headers, so Chrome would otherwise keep serving an old copy after the skill changes. The
+    vendored libraries are pinned and may stay cached.
+  -->
+  <script>
+    window.KANBAN_STAMP = Date.now().toString(36);
+    document.write(`<link rel="stylesheet" href="app.css?v=${window.KANBAN_STAMP}">`);
+  </script>
+  <script src="vendor/tailwindcss-browser.js"></script>
+  <!-- Tailwind utilities for shadcn's colour tokens, which Basecoat defines. -->
+  <style type="text/tailwindcss">
+    @custom-variant dark (&:where(.dark, .dark *));
+    @theme inline {
+      --color-background: var(--background);
+      --color-foreground: var(--foreground);
+      --color-card: var(--card);
+      --color-card-foreground: var(--card-foreground);
+      --color-muted: var(--muted);
+      --color-muted-foreground: var(--muted-foreground);
+      --color-accent: var(--accent);
+      --color-accent-foreground: var(--accent-foreground);
+      --color-primary: var(--primary);
+      --color-primary-foreground: var(--primary-foreground);
+      --color-secondary: var(--secondary);
+      --color-secondary-foreground: var(--secondary-foreground);
+      --color-destructive: var(--destructive);
+      --color-border: var(--border);
+      --color-input: var(--input);
+      --color-ring: var(--ring);
+    }
+  </style>
+  <!-- The templates (templates/*.js) register here: Mustache, filled in by app.js. -->
+  <script>window.KanbanTemplates = { partials: {} };</script>
+</head>
+<body>
+  <div id="app"></div>
+  <dialog id="modal" class="dialog kb-modal" aria-labelledby="modal-title">
+    <div id="modal-body"></div>
+  </dialog>
+  <!-- Over the card modal: the confirmation a delete asks for. -->
+  <dialog id="confirm" class="dialog" aria-label="Confirm"></dialog>
+  <!--
+    The scripts load one after another: Python's static server, which serves the board, takes
+    only a few connections at a time. A script that fails to load is tried again.
+  -->
+  <script>
+    (function load(scripts, i, tries) {
+      if (i === scripts.length) return;
+      const [src, optional] = scripts[i];
+      const s = document.createElement('script');
+      s.src = src.startsWith('vendor/') ? src : `${src}?v=${window.KANBAN_STAMP}`;
+      s.onload = () => load(scripts, i + 1, 0);
+      s.onerror = () => {
+        s.remove();
+        if (tries < (optional ? 1 : 5)) setTimeout(() => load(scripts, i, tries + 1), 250 * (tries + 1));
+        else if (optional) load(scripts, i + 1, 0);
+        else console.error(`kanban: couldn't load ${src}`);
+      };
+      document.body.append(s);
+    })([
+      ['vendor/basecoat.min.js', false],
+      ['vendor/Sortable.min.js', false],
+      ['vendor/mustache.min.js', false],
+      ['vendor/marked.umd.js', false],
+      ['vendor/purify.min.js', false],
+      ['vendor/js-yaml.min.js', false],
+      ['templates/dashboard.js', false],
+      ['templates/card-modal.js', false],
+      ['templates/new-card.js', false],
+      ['templates/fields.js', false],
+      ['templates/settings.js', false],
+      ['data.js', true],
+      ['app.js', false]
+    ], 0, 0);
+  </script>
+  <!-- data.js is the board, injected by the agent (see SKILL.md); app.js reloads it. -->
+</body>
+</html>
