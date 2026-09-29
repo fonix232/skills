@@ -9,7 +9,7 @@
 KanbanTemplates.newCard = /*html*/ `
 <header>
   <h2 id="modal-title" class="text-xl font-semibold">New card</h2>
-  <p>It becomes {{nextTicket}} once the agent writes it.</p>
+  <p>A unique ticket number is reserved when you create the card.</p>
 </header>
 
 <section class="kb-modal-body">

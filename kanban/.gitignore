@@ -1,2 +1,6 @@
 # A board the page is opened on while working on it.
 /board/data.js
+
+# Dashboard runtime and Python test artifacts.
+/.ai/local/
+__pycache__/

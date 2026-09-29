@@ -9,14 +9,11 @@
  * `_<column>.md` listing them in order. This page parses those files, fills in the Mustache
  * templates in templates/, and reloads data.js every few seconds to pick up changes.
  *
- * Nothing here writes a file. A change made on the page (dragging a card, editing one,
- * creating one, ticking or reordering a criterion or task) is applied to the page's own copy
- * at once and sent to the board's static server as GET .changes/<base64url JSON>. The server
- * answers 404 and logs the request: that log is the queue the agent applies to the Markdown.
- * A change carries what it means (op and its fields, a one-line summary) and the files it
- * results in (`writes`, `deletes`) from the version it was made on (`base`), so the agent can
- * write them as they are when nothing else changed in between. It shows as pending until
- * data.js lists its id in `applied`.
+ * The page sends JSON changes to the loopback server's durable inbox. The server never
+ * writes Markdown: the agent checks each change against fresh board files and applies it.
+ * Before snapshots protect touched paths; applied IDs acknowledge changes independently
+ * of the board's content version. Pending browser changes survive reloads when storage
+ * is available, and failed deliveries remain visible for retry.
  */
 (() => {
   'use strict';
@@ -36,6 +33,11 @@
     modal: null, // { kind: 'card', id, editing } or { kind: 'new' }
     sortables: [],
     followed: false,
+    restored: false,
+    delivery: {},
+    deliveryError: '',
+    storageError: '',
+    sending: false,
   };
 
   // ---------------------------------------------------------------- the Markdown files
@@ -333,6 +335,7 @@
 
     create(files, c) {
       const b = buildBoard(files);
+      if (b.cards.has(c.card)) throw new Error(`Ticket ${b.config.key}-${c.card} already exists. Create it with a new ticket number.`);
       const col = b.columns.find((x) => x.id === c.column) || b.columns[0];
       if (!col) return;
       const meta = { id: c.card, title: c.title, ...c.fields, created: c.created };
@@ -385,30 +388,72 @@
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
-  function base64url(text) {
-    const bytes = new TextEncoder().encode(text);
-    let bin = '';
-    bytes.forEach((b) => (bin += String.fromCharCode(b)));
-    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const outboxKey = () => `kanban-outbox:${S.data?.boardId || location.pathname}`;
+
+  function persistPending() {
+    try {
+      sessionStorage.setItem(outboxKey(), JSON.stringify(S.pending));
+      S.storageError = '';
+    } catch {
+      S.storageError = 'Browser storage is unavailable. Keep this page open until all changes are applied.';
+    }
+  }
+
+  async function post(path, data) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(new URL(path, location.href), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data), signal: controller.signal,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || `Request failed (${response.status})`);
+      }
+      return await response.json();
+    } finally { clearTimeout(timeout); }
+  }
+
+  async function sendPending() {
+    if (S.sending || !LIVE) return;
+    S.sending = true;
+    S.deliveryError = '';
+    try {
+      let c;
+      while ((c = S.pending.find((event) => S.delivery[event.id] !== 'queued'))) {
+        const result = await post('api/changes', c);
+        if (result.queued !== c.id) throw new Error('The server did not acknowledge this change. Retry delivery.');
+        S.delivery[c.id] = 'queued';
+      }
+    } catch (error) {
+      S.deliveryError = `Changes could not be delivered: ${error.message}. Your edits are retained; retry when the server is available.`;
+    } finally {
+      S.sending = false;
+      render();
+    }
   }
 
   // Applies a change on the page and hands it to the agent.
-  function commit(op, fields, summary) {
+  function commit(op, fields, summary, sourceFiles = null) {
     if (!LIVE) return;
     const c = { id: uid(), at: new Date().toISOString(), base: S.data?.version ?? null, op, summary, ...fields };
     const before = S.files;
     const after = applyChange(before, c);
     c.writes = {};
     c.deletes = [];
+    c.before = {};
+    c.requires = S.pending.map((p) => p.id);
     for (const [p, t] of Object.entries(after)) if (before[p] !== t) c.writes[p] = t;
     for (const p of Object.keys(before)) if (!(p in after)) c.deletes.push(p);
+    for (const p of [...Object.keys(c.writes), ...c.deletes]) c.before[p] = (sourceFiles || before)[p] ?? null;
     if (!Object.keys(c.writes).length && !c.deletes.length) return;
     S.pending.push(c);
     S.files = after;
     S.board = buildBoard(after);
+    persistPending();
     render();
-    const url = new URL(`.changes/${base64url(JSON.stringify(c))}`, location.href);
-    fetch(url, { cache: 'no-store' }).catch(() => {});
+    void sendPending();
     window.dispatchEvent(new CustomEvent('kanban:change', { detail: c }));
   }
 
@@ -416,10 +461,22 @@
 
   function accept(data) {
     S.data = data;
+    if (!S.restored) {
+      S.restored = true;
+      try {
+        const saved = JSON.parse(sessionStorage.getItem(outboxKey()) || '[]');
+        if (Array.isArray(saved)) S.pending = saved;
+      } catch { S.storageError = 'The saved browser outbox could not be read. Keep this page open and check the server inbox.'; }
+    }
     const applied = new Set(data.applied || []);
     S.pending = S.pending.filter((c) => !applied.has(c.id));
     let files = { ...(data.files || {}) };
-    for (const c of S.pending) files = applyChange(files, c);
+    S.replayError = '';
+    for (const c of S.pending) {
+      try { files = applyChange(files, c); }
+      catch (error) { S.replayError = `A pending change needs the agent's attention: ${error.message}`; break; }
+    }
+    persistPending();
     S.files = files;
     S.board = buildBoard(files);
     render();
@@ -427,6 +484,7 @@
     if (!S.followed) {
       S.followed = true;
       followHash();
+      if (S.pending.length) void sendPending();
     }
   }
 
@@ -436,7 +494,7 @@
     s.onload = s.onerror = () => {
       s.remove();
       const d = window.KANBAN_DATA;
-      if (d && d.version !== S.data?.version) accept(d);
+      if (d && (d.version !== S.data?.version || JSON.stringify(d.applied || []) !== JSON.stringify(S.data?.applied || []))) accept(d);
     };
     document.head.append(s);
   }
@@ -511,6 +569,7 @@
       query: S.query,
       editable: LIVE,
       pending: { count: S.pending.length, list: S.pending.map((p) => ({ summary: p.summary })) },
+      deliveryError: S.deliveryError, storageError: S.storageError, replayError: S.replayError,
       columns: S.board.columns.map((col) => ({ id: col.id, title: col.title, count: col.cards.length, cards: col.cards.map(tileView) })),
     };
   }
@@ -721,6 +780,7 @@
     }
     applyFilter();
     bindSortables();
+    showDeliveryError();
   }
 
   function applyFilter() {
@@ -774,8 +834,26 @@
     });
   }
 
+  function showDeliveryError() {
+    const body = $('#modal-body');
+    if (!body) return;
+    body.querySelectorAll('.kb-modal-delivery').forEach((el) => el.remove());
+    if (!S.deliveryError) return;
+    const notice = document.createElement('div');
+    notice.className = 'kb-delivery-error kb-modal-delivery';
+    notice.setAttribute('role', 'alert');
+    const message = document.createElement('p');
+    message.textContent = S.deliveryError;
+    const retry = document.createElement('button');
+    retry.type = 'button'; retry.className = 'btn'; retry.dataset.action = 'retry-delivery';
+    retry.textContent = 'Retry delivery';
+    notice.append(message, retry);
+    body.prepend(notice);
+  }
+
   function showModal(html) {
     $('#modal-body').innerHTML = html;
+    showDeliveryError();
     const d = $('#modal');
     if (!d.open) d.showModal();
   }
@@ -783,7 +861,7 @@
   function openCard(id, editing = false) {
     const card = S.board.cards.get(Number(id));
     if (!card) return;
-    S.modal = { kind: 'card', id: card.id, editing };
+    S.modal = { kind: 'card', id: card.id, editing, seen: editing ? editorValues(card) : null, incoming: {} };
     showModal(Mustache.render(T.cardModal, cardView(card, editing), T.partials));
     if (!editing && LIVE) bindTaskSortables($('#modal-body'), card.id);
   }
@@ -809,10 +887,102 @@
     $('#confirm-ticket')?.focus();
   }
 
-  // New data while a card is open: show the new version, unless it's being edited.
+  // Incoming values are offered next to each field; typing is never overwritten by polling.
+  function editorValues(card) {
+    return { title: card.title, column: card.column, body: card.body,
+      ...Object.fromEntries(S.board.config.fields.map((f) => [`field:${f.name}`, card.meta[f.name] ?? null])) };
+  }
+
+  const sameValue = (a, b) => (isEmpty(a) && isEmpty(b)) || JSON.stringify(a) === JSON.stringify(b);
+
+  function editorControl(key) {
+    const name = key.startsWith('field:') ? key.slice(6) : key;
+    return $(`[name="${CSS.escape(name)}"]`, $('#card-form'));
+  }
+
+  function showIncoming() {
+    const form = $('#card-form');
+    if (!form || !S.modal?.editing) return;
+    form.querySelectorAll('.kb-incoming').forEach((el) => el.remove());
+    for (const [key, value] of Object.entries(S.modal.incoming)) {
+      const control = editorControl(key);
+      if (!control) continue;
+      const notice = document.createElement('section');
+      notice.className = 'kb-incoming';
+      notice.dataset.field = key;
+      notice.setAttribute('role', 'status');
+      const title = document.createElement('strong');
+      title.textContent = 'Incoming edit';
+      const preview = document.createElement('pre');
+      preview.textContent = isEmpty(value) ? '(empty)' : Array.isArray(value) ? value.join(', ') : String(value);
+      notice.append(title, preview);
+      const actions = document.createElement('div');
+      actions.className = 'kb-incoming-actions';
+      notice.append(actions);
+      for (const action of ['accept', 'decline']) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn';
+        button.dataset.size = 'sm';
+        if (action === 'decline') button.dataset.variant = 'outline';
+        button.dataset.action = `incoming-${action}`;
+        button.dataset.field = key;
+        button.textContent = action === 'accept' ? 'Accept' : 'Decline';
+        actions.append(button);
+      }
+      (control.closest('.field, .kb-editor') || control.parentElement).append(notice);
+    }
+    if (S.modal.deleted) {
+      const notice = document.createElement('p');
+      notice.className = 'kb-incoming';
+      notice.setAttribute('role', 'alert');
+      notice.textContent = 'This card was deleted elsewhere. Your draft is still here to copy; close it when finished.';
+      form.prepend(notice);
+    }
+    const save = $('[type="submit"][form="card-form"]');
+    if (save) save.disabled = S.modal.deleted || Object.keys(S.modal.incoming).length > 0;
+  }
+
+  function resolveIncoming(key, acceptValue) {
+    if (!S.modal?.editing || !(key in S.modal.incoming)) return;
+    const value = S.modal.incoming[key];
+    const control = editorControl(key);
+    if (acceptValue && control) {
+      const field = key.startsWith('field:') && S.board.config.fields.find((f) => f.name === key.slice(6));
+      if (field?.kind === 'multiselect') {
+        const selected = (Array.isArray(value) ? value : []).map(String);
+        $('#card-form').querySelectorAll(`[name="${CSS.escape(field.name)}"]`).forEach((el) => { el.checked = selected.includes(el.value); });
+      } else {
+        const text = isEmpty(value) ? '' : Array.isArray(value)
+          ? value.map((v) => field?.kind === 'cards' ? ticketOf(v) : String(v)).join(', ') : String(value);
+        if (control.tagName === 'SELECT' && ![...control.options].some((o) => o.value === text)) {
+          control.add(new Option(text, text));
+        }
+        control.value = text;
+        if (key === 'body') {
+          const preview = $('[data-preview]', control.closest('.kb-editor'));
+          if (preview) preview.innerHTML = markdown(text, false);
+        }
+      }
+    }
+    delete S.modal.incoming[key];
+    showIncoming();
+  }
+
   function refreshModal() {
-    if (!S.modal || S.modal.kind !== 'card' || S.modal.editing || !$('#modal').open) return;
-    if (S.board.cards.has(S.modal.id)) openCard(S.modal.id);
+    if (!S.modal || S.modal.kind !== 'card' || !$('#modal').open) return;
+    const card = S.board.cards.get(S.modal.id);
+    if (S.modal.editing) {
+      S.modal.deleted = !card;
+      if (card) {
+        const current = editorValues(card);
+        for (const [key, value] of Object.entries(current)) {
+          if (!sameValue(value, S.modal.seen[key])) S.modal.incoming[key] = value;
+        }
+        S.modal.seen = current;
+      }
+      showIncoming();
+    } else if (card) openCard(S.modal.id);
     else closeModal();
   }
 
@@ -831,6 +1001,7 @@
       tab,
       errors: [],
       palette: null,
+      sourceFiles: { ...S.files },
       draft: {
         name: c.name,
         key: c.key,
@@ -940,6 +1111,9 @@
   function saveSettings() {
     const d = S.settings.draft;
     const errors = validateSettings(d);
+    for (const col of S.board.columns) {
+      if (col.cards.length && !d.columns.some((c) => c.id === col.id)) errors.push(`${col.title} now contains cards. Move them out before removing the column.`);
+    }
     if (errors.length) {
       S.settings.errors = errors;
       renderSettings();
@@ -957,9 +1131,10 @@
       })),
       template: d.template,
     };
+    const sourceFiles = S.settings.sourceFiles;
+    commit('config', { board }, 'Edit the board settings', sourceFiles);
     S.settings = null;
     closeModal();
-    commit('config', { board }, 'Edit the board settings');
   }
 
   function settingsAction(action, el) {
@@ -1022,6 +1197,7 @@
   }
 
   function saveCard(form) {
+    if (S.modal?.deleted || Object.keys(S.modal?.incoming || {}).length) return;
     const id = Number(form.dataset.id);
     const { title, column, body, fields } = readFields(form);
     if (!title) return;
@@ -1030,14 +1206,33 @@
     openCard(id);
   }
 
-  function createCard(form) {
+  async function createCard(form) {
+    if (form.dataset.submitting) return;
     const { title, column, body, fields } = readFields(form);
     if (!title) return;
-    const id = nextId();
-    const created = new Date().toISOString().slice(0, 10);
-    const col = S.board.columns.find((c) => c.id === column);
-    commit('create', { card: id, title, column, fields, body, created }, `New card ${ticketOf(id)} in ${col ? col.title : column}: ${title}`);
-    closeModal();
+    form.dataset.submitting = 'true';
+    // Reuse the reservation on retry, even if the response was lost after allocation.
+    const requestId = form.dataset.requestId || (form.dataset.requestId = uid());
+    const submit = $('[type="submit"][form="new-card-form"]');
+    if (submit) submit.disabled = true;
+    try {
+      const { card: id } = await post('api/reserve-id', { id: requestId });
+      if (!Number.isSafeInteger(id) || id < 1) throw new Error('The server returned an invalid ticket number');
+      const created = new Date().toISOString().slice(0, 10);
+      const col = S.board.columns.find((c) => c.id === column);
+      commit('create', { id: requestId, card: id, title, column, fields, body, created }, `New card ${ticketOf(id)} in ${col ? col.title : column}: ${title}`);
+      if ($('#new-card-form') === form) closeModal();
+    } catch (error) {
+      let notice = $('.kb-create-error', form);
+      if (!notice) {
+        notice = document.createElement('p'); notice.className = 'kb-create-error kb-incoming';
+        notice.setAttribute('role', 'alert'); form.prepend(notice);
+      }
+      notice.textContent = `Card not created: ${error.message}. Your draft is retained; try Create again.`;
+    } finally {
+      delete form.dataset.submitting;
+      if (submit) submit.disabled = false;
+    }
   }
 
   // ---------------------------------------------------------------- events
@@ -1075,6 +1270,13 @@
       return;
     }
     switch (action) {
+      case 'retry-delivery':
+        void sendPending();
+        break;
+      case 'incoming-accept':
+      case 'incoming-decline':
+        resolveIncoming(el.dataset.field, action === 'incoming-accept');
+        break;
       case 'open-card':
         openCard(el.dataset.id);
         break;
@@ -1165,17 +1367,18 @@
     if (!S.board) return;
     const h = decodeURIComponent(location.hash.slice(1));
     if (h === 'new') return LIVE && openNew();
-    const s = /^settings(?:\/(\w+))?$/.exec(h);
-    if (s) return LIVE && openSettings(TABS.includes(s[1]) ? s[1] : 'general');
     const m = new RegExp(`^${S.board.config.key}-(\\d+)(/edit)?$`).exec(h);
     if (m) openCard(m[1], Boolean(m[2]) && LIVE);
   }
   window.addEventListener('hashchange', followHash);
+  window.addEventListener('beforeunload', (event) => {
+    if (S.pending.some((c) => S.delivery[c.id] !== 'queued')) { event.preventDefault(); event.returnValue = ''; }
+  });
 
   if (window.KANBAN_DATA) accept(window.KANBAN_DATA);
   else render();
   setInterval(poll, POLL_MS);
 
   // For tests and for poking at the board from the console.
-  window.kanban = { state: S, buildBoard, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, LIVE };
+  window.kanban = { state: S, buildBoard, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, poll, sendPending, LIVE };
 })();

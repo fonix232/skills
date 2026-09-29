@@ -1,6 +1,6 @@
 // The board's tests: run by tests/index.html, on the board in fixture.js. Served over http
 // (see README.md), the page can send changes, so the editing checks run too.
-(() => {
+(async () => {
   const lines = [];
   let failed = 0;
   let passed = 0;
@@ -157,10 +157,15 @@
     window.addEventListener('kanban:change', (e) => sent.push(e.detail));
     const fetched = [];
     const realFetch = window.fetch;
-    window.fetch = (url, opts) => {
-      fetched.push(String(url));
-      return realFetch(url, opts);
+    let simulateFailure = false;
+    window.fetch = async (url, opts) => {
+      fetched.push({ url: String(url), opts });
+      if (simulateFailure) throw new Error('offline');
+      const payload = JSON.parse(opts.body);
+      return { ok: true, json: async () => String(url).endsWith('/api/reserve-id') ? { card: 5 } : { queued: payload.id } };
     };
+    const settled = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+
 
     k.openCard(1, true);
     const form = document.getElementById('card-form');
@@ -176,9 +181,10 @@
     eq('with the card as the agent should write it', written && [written.title, written.priority, written.roles, written.components, written.depends_on], ['First card, edited', 'P2', ['router', 'ap', 'switch'], ['agent', 'web'], [2, 3]]);
     eq('and what it was made on', c && c.base, 'fixture-1');
     has('and a summary', c && c.summary, 'Edit DEMO-1');
-    const payload = fetched[0] ? fetched[0].split('/.changes/')[1] : '';
-    const decoded = payload ? JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payload.replace(/-/g, '+').replace(/_/g, '/')), (ch) => ch.charCodeAt(0)))) : null;
-    eq('the request carries the change', decoded && decoded.id, c && c.id);
+    const decoded = JSON.parse(fetched[0].opts.body);
+    eq('the request carries JSON in a POST body', [fetched[0].opts.method, decoded.id], ['POST', c.id]);
+    eq('the before snapshot is the original file', c.before['todo/001-first-card.md'], files['todo/001-first-card.md']);
+    await settled();
     check('the card shows as pending', document.querySelector('.kb-tile[data-id="1"]').classList.contains('kb-pending'));
     has('and the top bar counts it', document.querySelector('.kb-topbar').textContent, '1 waiting for the agent');
     check('the modal shows the saved card', document.getElementById('modal-title').textContent === 'First card, edited');
@@ -239,6 +245,7 @@
     nf.querySelector('[name="title"]').value = 'Brand new';
     nf.querySelector('[name="type"]').value = 'chore';
     nf.requestSubmit();
+    await settled();
     const n = sent[sent.length - 1];
     eq('creating sends a change', [n && n.op, n && n.card, n && n.column], ['create', 5, 'doing']);
     check('with the new file', Boolean(n && n.writes['doing/005-brand-new.md']));
@@ -252,9 +259,115 @@
     eq('the rest still shows', tiles('doing'), [3, 5]);
     has('and the applied one is the data now', document.querySelector('.kb-tile[data-id="1"]').textContent, 'First card, edited');
 
+    // A settings draft retains its original before snapshot even if polling advances.
+    k.state.pending = [];
+    k.accept(data);
+    k.openSettings();
+    k.state.settings.draft.name = 'My settings draft';
+    const remoteConfig = { ...data, version: 'remote-config', files: { ...files, 'board.yml': files['board.yml'].replace('name: Demo', 'name: Remote') } };
+    k.accept(remoteConfig);
+    document.querySelector('[data-action="settings-save"]').click();
+    await settled();
+    const settingsEdit = sent[sent.length - 1];
+    eq('settings changes preserve the editor original snapshot', settingsEdit.before['board.yml'], files['board.yml']);
+    eq('settings changes use JSON POST without a card number', [settingsEdit.op, settingsEdit.card], ['config', undefined]);
+
+    k.state.pending = [];
+    k.accept(data);
+    k.openSettings('columns');
+    k.state.settings.draft.columns = k.state.settings.draft.columns.filter(c => c.id !== 'done');
+    k.accept({ ...data, version: 'column-filled', files: k.applyChange(files, { op: 'move', card: 1, column: 'done' }) });
+    document.querySelector('[data-action="settings-save"]').click();
+    has('a newly occupied column cannot disappear through a stale settings draft', document.querySelector('.kb-settings-errors').textContent, 'now contains cards');
+    check('the settings draft remains open for correction', document.getElementById('modal').open && k.state.settings !== null);
+    document.getElementById('modal').close();
+
+    // Resolve each incoming field independently without losing a local draft.
+    k.state.pending = [];
+    k.accept(data);
+    k.openCard(1, true);
+    const edit = document.getElementById('card-form');
+    edit.querySelector('[name="title"]').value = 'My local title';
+    edit.querySelector('[name="body"]').value = 'My local body';
+    const incomingFiles = k.applyChange(files, { op: 'save', card: 1, title: 'Remote title', column: 'doing',
+      fields: { priority: 'P2', roles: ['switch'], components: ['web'], depends_on: [3] }, body: 'Remote body' });
+    k.accept({ ...data, version: 'incoming-1', files: incomingFiles });
+    eq('incoming edits leave typing intact', [edit.querySelector('[name="title"]').value, edit.querySelector('[name="body"]').value], ['My local title', 'My local body']);
+    eq('each changed field gets a notice', edit.querySelectorAll('.kb-incoming').length, 7);
+    check('Save waits for all choices', document.querySelector('[form="card-form"][type="submit"]').disabled);
+    const decide = (key, action) => edit.querySelector(`.kb-incoming[data-field="${key}"] [data-action="incoming-${action}"]`).click();
+    decide('title', 'decline');
+    decide('body', 'accept');
+    decide('column', 'accept');
+    decide('field:priority', 'accept');
+    decide('field:roles', 'accept');
+    decide('field:components', 'accept');
+    decide('field:depends_on', 'accept');
+    eq('Decline keeps the local field', edit.querySelector('[name="title"]').value, 'My local title');
+    eq('Accept updates the body and status', [edit.querySelector('[name="body"]').value, edit.querySelector('[name="column"]').value], ['Remote body\n', 'doing']);
+    eq('Accept updates multiselects and card references', [[...edit.querySelectorAll('[name="roles"]:checked')].map(el => el.value), edit.querySelector('[name="depends_on"]').value], [['switch'], 'DEMO-3']);
+    check('Save enabled after all decisions', !document.querySelector('[form="card-form"][type="submit"]').disabled);
+    k.accept({ ...data, version: 'incoming-repeat', files: incomingFiles });
+    eq('decided notices do not recur on unchanged fields', edit.querySelectorAll('.kb-incoming').length, 0);
+    edit.requestSubmit();
+    await settled();
+    const resolved = sent[sent.length - 1];
+    eq('saved decision keeps local title and accepted body', [resolved.title, resolved.body], ['My local title', 'Remote body\n']);
+    eq('saved decision compares against the incoming disk snapshot', resolved.before['doing/001-first-card.md'], incomingFiles['doing/001-first-card.md']);
+
+    // The same field changing again needs a new decision; deletion retains the draft.
+    k.state.pending = [];
+    k.accept(data);
+    k.openCard(1, true);
+    const edit2 = document.getElementById('card-form');
+    k.accept({ ...data, version: 'incoming-2', files: incomingFiles });
+    const newer = k.applyChange(incomingFiles, { op: 'save', card: 1, title: 'Newest title', fields: {}, body: 'Remote body' });
+    k.accept({ ...data, version: 'incoming-3', files: newer });
+    has('a second incoming value updates its notice', edit2.querySelector('[data-field="title"]').textContent, 'Newest title');
+    const removed = k.applyChange(newer, { op: 'delete', card: 1 });
+    k.accept({ ...data, version: 'deleted', files: removed });
+    check('incoming deletion disables Save', document.querySelector('[form="card-form"][type="submit"]').disabled);
+    check('incoming deletion preserves the draft', edit2.querySelector('[name="title"]').value === first.title);
+    document.getElementById('modal').close();
+
+    // Content can return to its original hash while acknowledgement IDs still change.
+    k.state.pending = [];
+    k.accept(data);
+    k.commit('task', { card: 1, task: 1 }, 'tick');
+    k.commit('task', { card: 1, task: 1 }, 'untick');
+    await settled();
+    const acknowledgements = k.state.pending.map(p => p.id);
+    window.KANBAN_DATA = { ...data, applied: acknowledgements };
+    const append = document.head.append;
+    document.head.append = script => script.onload();
+    k.poll();
+    document.head.append = append;
+    eq('acknowledgement-only polling clears pending edits', k.state.pending.length, 0);
+
+    // Collision detection preserves an existing ticket instead of shadowing it in the Map.
+    let collision = false;
+    try { k.applyChange(files, { op: 'create', card: 1, column: 'todo', title: 'Duplicate', body: 'x' }); }
+    catch { collision = true; }
+    check('creating with an existing ID fails without altering the board', collision && k.buildBoard(files).cards.get(1).title === first.title);
+
+    // Failed deliveries stay visible, persist for reload, and retry the exact event ID.
+    k.accept(data);
+    simulateFailure = true;
+    k.commit('save', { card: 2, title: 'Large card', body: 'x'.repeat(30000), fields: {} }, 'large save');
+    await settled();
+    const failedId = k.state.pending[0].id;
+    check('a failed delivery shows Retry', Boolean(document.querySelector('[data-action="retry-delivery"]')));
+    check('a failed delivery is retained in session storage', Object.keys(sessionStorage).some(key => (sessionStorage.getItem(key) || '').includes(failedId)));
+    simulateFailure = false;
+    await k.sendPending();
+    check('retry clears the delivery error', !document.querySelector('[data-action="retry-delivery"]'));
+    eq('retry uses the same change id', JSON.parse(fetched[fetched.length - 1].opts.body).id, failedId);
+    check('large payloads are sent in the body, not URL', fetched[fetched.length - 1].url.length < 200 && fetched[fetched.length - 1].opts.body.length > 60000);
+    k.state.pending = [];
+    k.accept(data);
     window.fetch = realFetch;
   }
 
   document.getElementById('results').textContent = lines.join('\n');
   document.title = `${failed ? 'FAIL' : 'PASS'} ${failed ? failed : passed}`;
-})();
+})().catch(error => { document.title = 'FAIL exception'; document.getElementById('results').textContent += '\n' + error.stack; });

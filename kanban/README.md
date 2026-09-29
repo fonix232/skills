@@ -2,7 +2,7 @@
 
 A task board kept as Markdown in the repository, worked by an AI coding agent, with a dashboard in the browser. It's a skill for Claude Code (and any agent that reads `SKILL.md`): the agent keeps the board's files, and the page shows them and lets you change them.
 
-No program runs to keep the board. The skill is a ready-made CSS/JS framework and a set of templates. The agent injects the board's Markdown into the page, and the page renders it in the browser.
+A small Python standard-library server serves the dashboard, reads the Markdown, reserves ticket IDs and durably queues proposed edits. The agent remains responsible for all board-file changes.
 
 ## The board
 
@@ -26,12 +26,13 @@ Each card is Markdown with its fields in YAML front matter. `board.yml` defines 
 
 `board/` is the page: Basecoat (shadcn/ui's design system in plain HTML and CSS), Tailwind's browser build, Sortable for dragging, Mustache for the templates, marked and DOMPurify for Markdown, and js-yaml for front matter. All of it is vendored, so it works offline.
 
-- The agent links the page into the project's `.ai/local/kanban/` and writes the board next to it as `data.js`. It serves that folder with Python's built-in static server on `127.0.0.1:8124`. VS Code's Simple Browser can open it, as can any browser.
+- Run `python3 ~/.claude/skills/kanban/scripts/serve.py` from a project with `.ai/kanban/board.yml`. It serves fresh board data on `127.0.0.1:8124`; VS Code's Simple Browser can open it. Runtime state stays in ignored `.ai/local/kanban/`.
 - Tiles show the priority as the colour of their left edge, and the criteria and tasks done as a progress bar. You drag cards between columns and within them.
 - A card opens as JIRA shows an issue: the details (Markdown) in the main column, the fields in a side column, and the file behind an info icon. Criteria and tasks can be ticked, and dragged into another order within their list. Editing and creating cards use the same layout, with a Markdown preview.
 - Deleting takes two steps: the red Delete, then typing the ticket to confirm.
 - **Board** edits `board.yml` visually: the columns and their order, the fields (kind, tile, border colour, help, and a select's options with labels and colours picked from the theme's palette) and the new-card template.
-- The page writes nothing. Each change is sent to the static server as a request that it logs; the agent watches that log and applies the change to the Markdown, and the page shows it as pending until the agent has written it. Changes from the agent, an editor or git appear within three seconds.
+- The page sends JSON POST requests to a durable inbox. The agent checks fresh files, merges the changes and acknowledges application. Failed deliveries remain visible for retry. Incoming changes in an open editor have per-field Accept/Decline notices; the page never overwrites typing automatically.
+- Ticket numbers are reserved centrally, and acknowledgements clear pending edits even if the final board content is unchanged. Existing log-based sessions must be reconciled before switching; see `SKILL.md`.
 
 The templates are `board/templates/`:
 - `dashboard.js`: the board, its columns and card tiles;
@@ -50,6 +51,8 @@ Clone the skills repository, and link the skill in:
 Then ask the agent to set up a board, or to open one.
 
 ## Tests
+
+Run `python3 -m unittest discover -s tests -p 'test_*.py'` for HTTP and durable-inbox tests.
 
 The page's tests run in a browser, on a fixture board. Serve the repository, and open `tests/index.html`:
 

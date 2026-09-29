@@ -32,6 +32,11 @@ KanbanTemplates.dashboard = /*html*/ `
               aria-label="Switch between light and dark">{{> iconTheme}}</button>
     </div>
   </header>
+  {{#deliveryError}}
+  <div class="kb-delivery-error" role="alert">{{deliveryError}} <button type="button" class="btn" data-size="sm" data-action="retry-delivery">Retry delivery</button></div>
+  {{/deliveryError}}
+  {{#storageError}}<div class="kb-delivery-error" role="status">{{storageError}}</div>{{/storageError}}
+  {{#replayError}}<div class="kb-delivery-error" role="alert">{{replayError}}</div>{{/replayError}}
   <main class="kb-board">
     {{#columns}}
     <section class="kb-column" data-column="{{id}}" aria-label="{{title}}">

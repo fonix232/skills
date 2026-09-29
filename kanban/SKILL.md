@@ -1,14 +1,14 @@
 ---
 name: kanban
-description: "Work a repository's task board. The board is Markdown in the repository (.ai/kanban, committed): one folder per column, one card per task with its fields in front matter, ticket IDs (JIRA style, e.g. APP-12) for commit messages. Covers setting a board up, opening the dashboard (a page this skill ships, which the agent injects the board into and serves), applying the changes made on the dashboard, picking up queued work, moving cards, one verified commit per task, and the review/approval cycle. Use when the user says to work the board, pick up ready tasks, start or finish a task, open or show the board, asks what's next or how things stand, or asks for a board in a new repository."
+description: "Work a repository's task board. The board is Markdown in the repository (.ai/kanban, committed): one folder per column, one card per task with its fields in front matter, ticket IDs (JIRA style, e.g. APP-12) for commit messages. Covers setting a board up, opening the dashboard (a page this skill ships, served with fresh board data and a durable change inbox), applying the changes made on the dashboard, picking up queued work, moving cards, one verified commit per task, and the review/approval cycle. Use when the user says to work the board, pick up ready tasks, start or finish a task, open or show the board, asks what's next or how things stand, or asks for a board in a new repository."
 ---
 
 # Kanban
 
 A project's board is Markdown in the repository, under `.ai/kanban/`, committed with the work.
-This skill holds no program: a ready-made CSS/JS framework and templates (`board/`), which
-render the board in a browser, and these instructions. The agent keeps the files. It injects
-them into the page, and applies what the user changes there.
+The dashboard (`board/`) renders the board in a browser. A small standard-library Python
+server (`scripts/serve.py`) reads the board and durably queues browser changes. Only the
+agent edits the Markdown files; the server never applies a change to them.
 
 ## The board: `.ai/kanban/`
 
@@ -100,99 +100,112 @@ What's done, what's verified and how, and what's left. Rewrite it; git has the h
 
 ## The dashboard
 
-The page is `board/` in this skill. It needs the board injected next to it as `data.js`, and a static server so that VS Code's Simple Browser can open it and so that its changes can reach you. Everything below runs from the repository's root, and everything it makes lives in `.ai/local/kanban/`, which is untracked.
+The server reads `.ai/kanban/` fresh on every poll and serves it as `data.js`. All runtime
+state lives under ignored `.ai/local/kanban/`. Run these commands from the project root.
 
-**1. Inject** the board: link the page's files and write `data.js`. Do this again after every change you make to `.ai/kanban/`, so the page shows it (it reloads `data.js` every 3 s).
-
-```sh
-python3 - <<'EOF'
-import hashlib, json, os, pathlib
-from datetime import datetime, timezone
-board, view = pathlib.Path('.ai/kanban'), pathlib.Path('.ai/local/kanban')
-page = pathlib.Path(os.path.expanduser('~/.claude/skills/kanban/board')).resolve()
-view.mkdir(parents=True, exist_ok=True)
-for name in ('index.html', 'app.js', 'app.css', 'templates', 'vendor'):
-    link = view / name
-    if link.is_symlink() and link.resolve() != (page / name).resolve():
-        link.unlink()  # the skill moved
-    if not link.is_symlink():
-        link.symlink_to(page / name)
-paths = [p for p in sorted(board.rglob('*'))
-         if p.is_file() and p.suffix in ('.md', '.yml') and p.name != 'README.md']
-files = {p.relative_to(board).as_posix(): p.read_text(encoding='utf-8') for p in paths}
-stats = {p.relative_to(board).as_posix(): {'modified': datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat(),
-                                           'size': p.stat().st_size} for p in paths}
-applied = view / 'applied.json'
-data = {'version': hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:12],
-        'applied': (json.loads(applied.read_text()) if applied.exists() else [])[-500:],
-        'files': files, 'stats': stats}
-tmp = view / 'data.js.tmp'
-tmp.write_text('window.KANBAN_DATA = ' + json.dumps(data, ensure_ascii=False) + ';\n', encoding='utf-8')
-tmp.replace(view / 'data.js')
-print('injected', len(files), 'files as version', data['version'])
-EOF
-```
-
-**2. Serve** it on loopback, unless it's already up (`curl -sf http://127.0.0.1:8124/ >/dev/null`):
+**1. Start the dashboard.** Check `http://127.0.0.1:8124/api/health` first; reuse it only
+if its `service` is `kanban-inbox` and its `board` is this project's resolved board path.
+Use another port for a different board. Confirm `/.ai/local/` is ignored before starting.
 
 ```sh
-nohup python3 -m http.server 8124 --bind 127.0.0.1 --directory .ai/local/kanban >> .ai/local/kanban/server.log 2>&1 &
+mkdir -p .ai/local/kanban
+nohup python3 ~/.claude/skills/kanban/scripts/serve.py \
+  --board .ai/kanban --view .ai/local/kanban --port 8124 \
+  >> .ai/local/kanban/server.log 2>&1 &
+echo $! > .ai/local/kanban/server.pid
 ```
 
-Give the user the link, `http://127.0.0.1:8124/`. In VS Code, a workspace whose `workbench.externalUriOpeners` maps `127.0.0.1:8124` to `simpleBrowser.open` opens it in the Simple Browser. `#APP-12` opens a card, `#APP-12/edit` its editor, `#new` the New card form. Another project's board needs another port, and its own mapping.
+Give the user `http://127.0.0.1:8124/`. It also works in VS Code's Simple Browser.
+`#APP-12` opens a card, `#APP-12/edit` its editor, and `#new` the New card form.
+The page refreshes every 3 seconds. In an open editor, incoming field changes appear
+beside that field with **Accept** and **Decline** buttons. Accept replaces the local value;
+Decline keeps it. Resolve every notice before saving. An incoming deletion keeps the draft
+visible for copying and disables Save.
 
-**3. Watch for changes** while the page is open. Run a Monitor on the server log, and re-arm it when it expires:
+**2. Read the durable inbox** while working the board, and whenever resuming a session:
 
 ```sh
-tail -n 0 -F .ai/local/kanban/server.log | grep --line-buffered -o 'GET /\.changes/[A-Za-z0-9_-]*'
+curl -fsS http://127.0.0.1:8124/api/changes
 ```
 
-**4. Apply** the changes. The page doesn't write files. Each change the user makes is sent to the server as `GET /.changes/<base64url JSON>`; the server answers 404 and logs it, and the log is the queue. Each event from the watch, or any time you pick the board up, list what's pending:
-
-```sh
-python3 - <<'EOF'
-import base64, json, pathlib, re
-view = pathlib.Path('.ai/local/kanban')
-done = set(json.loads((view / 'applied.json').read_text())) if (view / 'applied.json').exists() else set()
-version = re.search(r'"version": "([^"]+)"', (view / 'data.js').read_text()).group(1)
-for m in re.finditer(r'GET /\.changes/([A-Za-z0-9_-]+)', (view / 'server.log').read_text(errors='replace')):
-    c = json.loads(base64.urlsafe_b64decode(m.group(1) + '=' * (-len(m.group(1)) % 4)))
-    if c['id'] not in done:
-        done.add(c['id'])
-        print(json.dumps({**c, 'base_is_current': c.get('base') == version}, ensure_ascii=False))
-EOF
-```
+The page sends `POST /api/changes` with a JSON body. The server acknowledges it only after
+committing it to `.ai/local/kanban/inbox.sqlite3`; retries with the same change ID are
+idempotent. Changes remain pending until the agent explicitly acknowledges application.
+Delivery failures show a Retry button; the browser retains pending changes across reloads
+when storage is available. The request limit is 8 MiB; oversized changes show an error.
+Do not delete or truncate the inbox. `server.log` is diagnostic output, never a queue.
+Poll the inbox periodically while assisting the user; no special Monitor tool is required.
 
 Each change has:
-- `summary`, one line;
-- `op` and its intent:
-  - `move` (card, column, index);
-  - `save` (card, title, column, fields, body);
-  - `create` (card, title, column, fields, body, created);
-  - `delete` (card), which the page confirms twice, the second time by the ticket typed in;
-  - `task` (card, task): tick or untick the body's nth task list item, counting criteria and tasks together;
-  - `reorder` (card, task, index): move the nth item to position `index` within its own list, along with its continuation lines and nested items;
-  - `config` (board: the whole settings): rewrite `board.yml`, give a new column its folder's `_<column>.md`, rewrite the order files when the key changed, and drop the order file of a removed column, which must be empty;
-- `writes` (path to content, relative to `.ai/kanban/`) and `deletes`: the files the change results in on the version it was made on (`base`).
+- `id`, `summary`, and `base` (the board-content version last loaded);
+- `requires`: earlier pending changes it was built on; apply these first;
+- `op` and its intent: `move` (card, column, index), `save` (card, title, column, fields,
+  body), `create` (card, title, column, fields, body, created), `delete` (card), `task`
+  (card, task index), `reorder` (card, task index, destination index within its list), or
+  `config` (the edited board settings, including columns, fields and template; it updates
+  `board.yml` and the affected column order files, including new/removed empty columns);
+- `writes` and `deletes`, relative to `.ai/kanban/`, and `before`: the original text of
+  every touched path, or `null` when that path did not exist. These snapshots include any
+  preceding pending edits; they are more precise than `base` alone.
 
-Apply the changes in order:
-- **`base_is_current` is true** (nothing else changed the board since it was injected): write every path in `writes` exactly as given, and delete the `deletes`.
-- **Otherwise**, apply the intent to the files as they are now.
+**3. Check and apply one change at a time.** Immediately before applying each event, ask
+for a fresh comparison against the actual files, using that event's ID:
 
-When a change conflicts with something you changed meanwhile, keep both where you can, and tell the user what you did.
+```sh
+curl -fsS -H 'Content-Type: application/json' \
+  -d '{"id":"CHANGE_ID"}' http://127.0.0.1:8124/api/check-change
+```
 
-Then:
-1. Append the ids to `.ai/local/kanban/applied.json` (a JSON list), and inject again. The page stops showing them as pending.
-2. Once nothing is pending, empty the log (`: > .ai/local/kanban/server.log`); it grows by a line every 3 s the page is open.
+- If `blocked_by` is nonempty, finish those prerequisite changes first.
+- If `already_written` is true, verify the complete result and acknowledge it without
+  replaying toggles or creates; this handles a previous session stopping before acknowledgement.
+- If `paths_match` is true, all touched files still match their `before` snapshots. Write
+  the specified contents and remove the specified files. Check that paths resolve inside
+  the board and recheck any file that changes between comparison and writing.
+- Otherwise, read the current files and merge the intent using `before`, the proposed
+  contents, and the actual contents. Never treat an old injected version or the batch's
+  initial comparison as proof that later writes are safe. For checklist changes, identify
+  the original item by its text/context; a changed index alone is not enough.
+- For `config`, compare against the settings editor's original `board.yml` snapshot and
+  keep unrelated configuration changes. Never remove a column that now contains cards.
+- Preserve independent edits. Leave ambiguous conflicts pending and explain them to the
+  user; do not acknowledge or apply dependent events until resolved.
 
-Don't commit on your own: a change from the page is board upkeep (see above).
+Creating cards reserves an ID through `POST /api/reserve-id` with `{"id":"UNIQUE_REQUEST_ID"}`.
+The server serializes reservations and takes the maximum across current card IDs, stored
+reservations and numbered card filenames in available Git history, including deletions.
+Keep the inbox database when restarting; a shallow clone cannot recover history it lacks.
+The browser uses its create-event ID as the reservation key, so retries get the same ticket.
+When the agent creates cards while the dashboard is running, use this endpoint too.
+Before writing a create, check the full board for that ID; never overwrite an existing card
+or create duplicate IDs. If an out-of-band edit consumed a reserved ID, leave the event
+pending and resolve the collision and its dependent references before applying it.
 
-**Stop** the server when you're done: `pkill -f 'http.server 8124'`.
+**4. Acknowledge only verified results**, by posting the successfully applied event IDs:
+
+```sh
+curl -fsS -H 'Content-Type: application/json' \
+  -d '{"ids":["CHANGE_ID"]}' http://127.0.0.1:8124/api/applied
+```
+
+New arrivals remain in the inbox during acknowledgement; nothing is truncated. The next
+poll clears pending indicators even if the board's contents ended up unchanged. Refresh
+the board README before committing. Dashboard edits are board upkeep: do not commit them
+unless the user asks for a commit or push.
+
+**Stop** only the server started for this board. Read `server.pid`, verify that the PID's
+command is this server with the expected board/view arguments, then send it SIGTERM.
+Do not use a broad `pkill` pattern or remove the inbox when stopping.
+
+**Existing log-based sessions:** finish applying and verifying their pending log events
+with the previous client before switching servers. Keep `server.log` and `applied.json`
+until reconciled; the new inbox does not automatically import old GET events. Stop the
+old server before starting the POST server on the same port, then reload the dashboard.
 
 ## Setting up a board
 
 1. Create `.ai/kanban/` with `board.yml` from `templates/board.yml`. Set the name and the ticket key (the user's choice, two to four capitals) and adjust the columns and fields.
 2. Make a folder per column, each with its `_<column>.md` ("No cards.").
 3. Write `README.md` from `templates/readme.md`.
-4. Add a line on the board to the repository's `.ai/AGENTS.md` conventions: tasks live in `.ai/kanban` (this skill), ticket IDs in commit subjects, one task one commit.
+4. Add a line on the board to the repository's `.ai/instructions.md` conventions: tasks live in `.ai/kanban` (this skill), ticket IDs in commit subjects, one task one commit.
 5. Commit it as `Board: set up`.
