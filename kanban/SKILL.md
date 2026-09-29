@@ -1,6 +1,6 @@
 ---
 name: kanban
-description: "Work a repository's task board. The board is Markdown in the repository (.ai/kanban, committed): one folder per column, one card per task with its fields in front matter, ticket IDs (JIRA style, e.g. APP-12) for commit messages. Covers setting a board up, opening the dashboard (a page this skill ships, served with fresh board data and a durable change inbox), applying the changes made on the dashboard, picking up queued work, moving cards, one verified commit per task, and the review/approval cycle. Use when the user says to work the board, pick up ready tasks, start or finish a task, open or show the board, asks what's next or how things stand, or asks for a board in a new repository."
+description: "Work a repository's task board. The board is Markdown in the repository (.ai/kanban, committed): one folder per column, one card per task with its fields in front matter, ticket IDs (JIRA style, e.g. APP-12) for commit messages. Covers setting a board up, opening the dashboard (a page this skill ships, served with fresh board data and a durable change inbox), applying the changes made on the dashboard, picking up queued work, moving cards, one verified commit per task, and the review cycle (end-to-end verification, then Done in the ticket's own commit). Use when the user says to work the board, pick up ready tasks, start or finish a task, open or show the board, asks what's next or how things stand, or asks for a board in a new repository."
 ---
 
 # Kanban
@@ -84,16 +84,21 @@ What's done, what's verified and how, and what's left. Rewrite it; git has the h
 
 ## Working the board
 
+A ticket moves through the columns in order, and each move has an owner:
+
+1. **Backlog**: the agent writes the cards. Their criteria say they're written when the card is scheduled.
+2. **Next**: the user reads the backlog and moves the cards they want next.
+3. **Ready to start**: the user and the agent agree the next sprint's scope and move those cards here. The agent writes each card's criteria as it's scheduled.
+4. **In progress**: the agent works the Ready cards one ticket at a time, in parallel where tickets don't touch the same code, and moves each card here when it starts. Each ticket is designed, developed, tested (unit, integration and end-to-end tests written) and verified (checked by hand, on real devices where it matters).
+5. **In review**: once all four are done, the agent:
+   - rewrites the card's Progress: what's done, how it was verified, what isn't;
+   - ticks the criteria that are met, and only those;
+   - moves the card here;
+   - commits the ticket (`APP-12: Password reset by email`).
+6. **Done**: review is end-to-end verification by someone other than the author, such as verifier agents fanned out one per area. It covers the whole test suite, every criterion, and edge cases on the happy and unhappy paths. A verified ticket's card moves to Done inside the ticket's own commit (amend it, or rewrite the history when later commits followed), and the result is pushed when the user says so. A ticket that fails review goes back to In progress with what failed in its Progress.
+
 - **Read the board before picking work**: the user moves cards on the page and by hand.
-- **Work "Ready to start" top to bottom, one task at a time.**
-  1. Move the card to "In progress".
-  2. If its criteria say they're written when it's scheduled, write them first.
-  3. Implement, and run the repository's whole verification flow.
-  4. Rewrite the card's Progress: what's done, how it was verified, what isn't.
-  5. Tick the criteria that are met, and only those.
-  6. Move the card to "In review", and commit.
-- **One task, one commit.** The subject starts with its ticket (`APP-12: Password reset by email`). The commit carries the card too: its move and its Progress.
-- **Only the user moves a card to Done.**
+- **One task, one commit.** The subject starts with its ticket. The commit carries the card too: its moves and its Progress.
 - **Board upkeep never gets a card or a ticket.** New cards, reordering, and the user's moves on the page are committed as their own commit, subject `Board: <what changed>`, when the user asks for a commit or a push. They never ride in a task's commit.
 - **No history in the cards.** There are no revision logs and no "imported from" notes: git keeps the history.
 - To answer "how are things", read the columns in order: in progress, in review, ready, next.
