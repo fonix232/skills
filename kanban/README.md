@@ -24,13 +24,13 @@ Each card is Markdown with its fields in YAML front matter. `board.yml` defines 
 
 ## The dashboard
 
-`board/` is the page: Basecoat (shadcn/ui's design system in plain HTML and CSS), Tailwind's browser build, Sortable for dragging, Mustache for the templates, marked and DOMPurify for Markdown, and js-yaml for front matter. All of it is vendored, so it works offline.
+`board/` is the page: Basecoat (shadcn/ui's design system in plain HTML and CSS), Tailwind's browser build, Sortable for dragging, Mustache for the templates, marked and DOMPurify for Markdown, Toast UI Editor for editing it, and js-yaml for front matter. All of it is vendored, so it works offline.
 
 - Run `python3 ~/.claude/skills/kanban/scripts/serve.py` from a project with `.ai/kanban/board.yml`. It serves fresh board data on `127.0.0.1:8124`; VS Code's Simple Browser can open it. Runtime state stays in ignored `.ai/local/kanban/`.
 - Tiles show the priority as the colour of their left edge, and the criteria and tasks done as a progress bar. You drag cards between columns and within them.
-- A card opens as JIRA shows an issue: the details (Markdown) in the main column, the fields in a side column, and the file behind an info icon. Criteria and tasks can be ticked, and dragged into another order within their list. Editing and creating cards use the same layout, with a Markdown preview.
+- A card opens as JIRA shows an issue: the details (Markdown) in the main column, the fields in a side column, and the file behind an info icon. Criteria and tasks can be ticked, and dragged into another order within their list. Editing and creating cards use the same layout, with a rich (WYSIWYG) Markdown editor that also has a plain Markdown mode. Saving keeps the exact text of every paragraph, list or table you didn't change; only the blocks you edited are rewritten, in the editor's style with `-` bullets.
 - Deleting takes two steps: the red Delete, then typing the ticket to confirm.
-- **Board** edits `board.yml` visually: the columns and their order, the fields (kind, tile, border colour, help, and a select's options with labels and colours picked from the theme's palette) and the new-card template.
+- **Board** edits `board.yml` visually: the columns and their order, the fields (kind, tile, border colour, help, and a select's options with labels and colours picked from the theme's palette) and the new-card template. The dialog keeps one height across its tabs.
 - The page sends JSON POST requests to a durable inbox. The agent checks fresh files, merges the changes and acknowledges application. Failed deliveries remain visible for retry. Incoming changes in an open editor have per-field Accept/Decline notices; the page never overwrites typing automatically.
 - Settings changes that affect existing card values require a migration review. Keep the original field, choose replacement values, or explicitly confirm removals; settings and migrations travel together.
 - Incoming settings have Accept/Decline notices. Open card editors retain typing while the user reviews a changed schema.

@@ -787,6 +787,123 @@
     }
   }
 
+  // ---------------------------------------------------------------- the rich editor
+
+  // A card's details are edited in Toast UI's WYSIWYG editor. Its textarea stays the value
+  // the form sends (and what incoming edits change); the editor fills it on every change.
+  // Toast UI writes Markdown in its own style (`*` bullets, escapes, four-space nesting), so
+  // the blocks you didn't touch keep their exact original text: `mergeMarkdown`.
+  const RICH = new WeakMap(); // textarea → { editor, original, base, quiet }
+
+  // A body's blocks (paragraphs, lists, headings, link definitions, …), each with the blank
+  // lines before it, and what follows the last one: together, the text exactly.
+  function blocksOf(md) {
+    const blocks = [];
+    let gap = '';
+    for (const t of marked.lexer(String(md || ''))) {
+      if (t.type === 'space') {
+        gap += t.raw;
+        continue;
+      }
+      const text = t.raw.replace(/\n+$/, '');
+      blocks.push({ text, gap });
+      gap = t.raw.slice(text.length);
+    }
+    return { blocks, tail: gap };
+  }
+
+  // A block's text as it reads, to check that two blocks say the same thing.
+  function plainOf(md) {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = DOMPurify.sanitize(marked.parse(md));
+    tpl.content.querySelectorAll('input[type="checkbox"]').forEach((cb) => cb.replaceWith(cb.checked ? '[x]' : '[ ]'));
+    return tpl.content.textContent.replace(/\s+/g, '');
+  }
+
+  // Toast UI's style for a block it wrote: `-` bullets, and no escapes inside words.
+  const tidy = (block) => block.replace(/^(\s*)\*(\s)/gm, '$1-$2').replace(/(\w)\\_(?=\w)/g, '$1_');
+
+  // `edited` is what the editor holds now; `base` is what it wrote for `original` before any
+  // edit. Blocks unchanged since `base` come back as `original` had them, spacing and all.
+  function mergeMarkdown(original, base, edited) {
+    if (edited === base) return original;
+    const { blocks: O, tail } = blocksOf(original);
+    const A = blocksOf(base).blocks.map((b) => b.text);
+    const B = blocksOf(edited).blocks.map((b) => b.text);
+    const end = original.endsWith('\n') ? '\n' : '';
+    // Only when the editor's blocks line up with the original's, one for one.
+    if (O.length !== A.length || O.some((o, i) => plainOf(o.text) !== plainOf(A[i]))) return B.map(tidy).join('\n\n') + end;
+    const n = A.length;
+    const m = B.length;
+    const lcs = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) lcs[i][j] = A[i] === B[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+    let out = '';
+    let last = -2; // the original's block written last, when it was
+    let i = 0;
+    let j = 0;
+    while (j < m) {
+      if (i < n && A[i] === B[j]) {
+        if (out) out += last === i - 1 ? O[i].gap : '\n\n';
+        out += O[i].text;
+        last = i++;
+        j++;
+      } else if (i < n && lcs[i + 1][j] >= lcs[i][j + 1]) i++;
+      else {
+        out += (out ? '\n\n' : '') + tidy(B[j++]);
+        last = -2;
+      }
+    }
+    return out + (last === n - 1 ? tail : end);
+  }
+
+  function mountRichEditors(root) {
+    if (!window.toastui) return;
+    root.querySelectorAll('textarea.kb-body').forEach((textarea) => {
+      if (RICH.has(textarea)) return;
+      const host = document.createElement('div');
+      host.className = 'kb-rich';
+      textarea.hidden = true;
+      textarea.after(host);
+      const state = { original: textarea.value, base: '', quiet: true };
+      state.editor = new toastui.Editor({
+        el: host,
+        height: 'auto',
+        minHeight: '22rem',
+        initialEditType: 'wysiwyg',
+        initialValue: textarea.value,
+        previewStyle: 'tab',
+        usageStatistics: false,
+        theme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+        toolbarItems: [['heading', 'bold', 'italic', 'strike'], ['hr', 'quote'], ['ul', 'ol', 'task', 'indent', 'outdent'], ['table', 'link'], ['code', 'codeblock']],
+        customMarkdownRenderer: { bulletList: () => ({ delim: '-' }) },
+        events: {
+          change: () => {
+            if (state.quiet) return;
+            textarea.value = mergeMarkdown(state.original, state.base, state.editor.getMarkdown());
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+          },
+        },
+      });
+      state.base = state.editor.getMarkdown();
+      state.quiet = false;
+      RICH.set(textarea, state);
+    });
+  }
+
+  // Replaces what an editor holds (an accepted incoming edit), as if it had opened on it.
+  function loadRich(textarea, text) {
+    textarea.value = text;
+    const state = RICH.get(textarea);
+    if (!state) return;
+    state.quiet = true;
+    state.original = text;
+    state.editor.setMarkdown(text, false);
+    state.base = state.editor.getMarkdown();
+    state.quiet = false;
+  }
+
   // ---------------------------------------------------------------- rendering
 
   const $ = (sel, root = document) => root.querySelector(sel);
@@ -886,6 +1003,9 @@
 
   function showModal(html) {
     $('#modal-body').innerHTML = html;
+    // The settings keep one height across their tabs; cards size to their content.
+    $('#modal').classList.toggle('kb-settings-modal', S.modal?.kind === 'settings');
+    mountRichEditors($('#modal-body'));
     showDeliveryError();
     const d = $('#modal');
     if (!d.open) d.showModal();
@@ -1004,10 +1124,7 @@
           control.add(new Option(text, text));
         }
         control.value = text;
-        if (key === 'body') {
-          const preview = $('[data-preview]', control.closest('.kb-editor'));
-          if (preview) preview.innerHTML = markdown(text, false);
-        }
+        if (key === 'body') loadRich(control, text);
       }
     }
     delete S.modal.incoming[key];
@@ -1248,7 +1365,7 @@
       const controls = [...form.elements].filter(e => e.name === old.name);
       for (const e of controls) {
         if (e.type === 'checkbox' || e.type === 'radio') { if (e.value === old.value) e.checked = old.checked; }
-        else { if (['number', 'date'].includes(e.type)) e.type = 'text'; if (e.tagName === 'SELECT' && ![...e.options].some(o => o.value === old.value)) e.add(new Option(`${old.value} (draft value)`, old.value)); e.value = old.value; }
+        else { if (['number', 'date'].includes(e.type)) e.type = 'text'; if (e.tagName === 'SELECT' && ![...e.options].some(o => o.value === old.value)) e.add(new Option(`${old.value} (draft value)`, old.value)); e.value = old.value; if (RICH.has(e)) loadRich(e, old.value); }
       }
     }
   }
@@ -1496,18 +1613,6 @@
       $('#confirm').close();
       return;
     }
-    const tab = e.target.closest('.kb-editor [role="tab"]');
-    if (tab) {
-      const editor = tab.closest('.kb-editor');
-      editor.querySelectorAll('[role="tab"]').forEach((t) => {
-        const on = t === tab;
-        t.setAttribute('aria-selected', String(on));
-        t.tabIndex = on ? 0 : -1;
-        document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
-      });
-      if (tab.id === 'tab-preview') $('[data-preview]', editor).innerHTML = markdown($('textarea', editor).value, false);
-      return;
-    }
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const action = el.dataset.action;
@@ -1614,7 +1719,9 @@
     else if (form.dataset.action === 'create-card') createCard(form);
   });
 
+  // The close event comes a moment after close(): by then another modal may have opened.
   $('#modal').addEventListener('close', () => {
+    if ($('#modal').open) return;
     S.modal = null;
     S.settings = null;
   });
@@ -1640,5 +1747,5 @@
   setInterval(poll, POLL_MS);
 
   // For tests and for poking at the board from the console.
-  window.kanban = { state: S, buildBoard, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, poll, sendPending, LIVE };
+  window.kanban = { mergeMarkdown, rich: (textarea) => RICH.get(textarea)?.editor, state: S, buildBoard, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, poll, sendPending, LIVE };
 })();

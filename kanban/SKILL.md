@@ -121,6 +121,9 @@ The page refreshes every 3 seconds. In an open editor, incoming field changes ap
 beside that field with **Accept** and **Decline** buttons. Accept replaces the local value;
 Decline keeps it. Resolve every notice before saving. An incoming deletion keeps the draft
 visible for copying and disables Save.
+Details are edited in a rich Markdown editor. A saved body keeps the exact text of every
+block the user didn't touch; blocks they edited come back in the editor's style (`-`
+bullets, four-space nesting), which is theirs to keep, not to normalize.
 
 **2. Read the durable inbox** while working the board, and whenever resuming a session:
 

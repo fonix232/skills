@@ -107,6 +107,21 @@
   const dropEmpty = k.applyChange(files, { op: 'config', board: { ...cfg, columns: cfg.columns.filter((c) => c.id !== 'done') } });
   check('an empty one can, order file and all', !('done/_done.md' in dropEmpty) && !dropEmpty['board.yml'].includes('id: done'));
 
+  // ---- the rich editor: what it didn't change keeps its exact text
+  const original = 'An intro naming snake_case.\n\n- one\n  - nested\n- two\n\n\n## Tasks\n\n- [ ] first\n- [x] second\n\nClosing words.\n';
+  const host = document.createElement('div');
+  document.body.append(host);
+  const ed = new toastui.Editor({ el: host, initialValue: original, initialEditType: 'wysiwyg', usageStatistics: false, customMarkdownRenderer: { bulletList: () => ({ delim: '-' }) } });
+  const base = ed.getMarkdown();
+  ed.destroy();
+  host.remove();
+  check('the editor writes Markdown its own way', base !== original, 'it wrote the original unchanged');
+  eq('an untouched body comes back byte for byte', k.mergeMarkdown(original, base, base), original);
+  eq('an edited paragraph is the only change', k.mergeMarkdown(original, base, base.replace('Closing words.', 'Closing words, edited.')), original.replace('Closing words.', 'Closing words, edited.'));
+  eq('new blocks come in with - bullets and no escapes', k.mergeMarkdown(original, base, `${base.trimEnd()}\n\nA new\\_name.\n\n* added`), `${original}\nA new_name.\n\n- added\n`);
+  eq('a deleted block goes', k.mergeMarkdown(original, base, base.replace(/\n*Closing words\.\n*$/, '')), original.replace('\n\nClosing words.', ''));
+  eq('blocks that don\'t line up take the editor\'s text', k.mergeMarkdown('one\n\ntwo', 'one two', '* x'), '- x');
+
   // ---- the dashboard
   const tiles = (col) => [...document.querySelectorAll(`.kb-cards[data-column="${col}"] .kb-tile`)].map((t) => Number(t.dataset.id));
   eq('tiles in their columns, in order', [tiles('todo'), tiles('doing'), tiles('done')], [[2, 1, 4], [3], []]);
@@ -239,6 +254,21 @@
     check('the settings close', !document.getElementById('modal').open);
     eq('the board shows the new column at once', [...document.querySelectorAll('.kb-column')].map((c) => c.dataset.column).pop(), 'blocked');
 
+    // The settings keep one height across their tabs; the template has the rich editor.
+    sessionStorage.clear(); k.openSettings('general');
+    const heights = [];
+    for (const tab of ['general', 'columns', 'fields', 'template']) {
+      document.querySelector(`#modal [data-action="settings-tab"][data-tab="${tab}"]`).click();
+      heights.push(Math.round(document.querySelector('#modal > div').getBoundingClientRect().height));
+    }
+    eq('the settings keep one height across tabs', new Set(heights).size, 1);
+    const tpl = document.querySelector('#modal textarea[data-bind="template"]');
+    k.rich(tpl).setMarkdown(`${k.rich(tpl).getMarkdown().trimEnd()}\n\nA template line.`);
+    has('editing the template changes the draft', k.state.settings.draft.template, 'A template line.');
+    const keepConfirm = window.confirm;
+    window.confirm = () => true; document.querySelector('#modal [data-action="close"]').click(); await settled(); window.confirm = keepConfirm;
+    sessionStorage.clear();
+
     k.openNew('doing');
     const nf = document.getElementById('new-card-form');
     has('a new card starts from the template', nf.querySelector('[name="body"]').value, '## Acceptance criteria');
@@ -291,6 +321,13 @@
     k.accept(data);
     k.openCard(1, true);
     const edit = document.getElementById('card-form');
+    const bodyArea = edit.querySelector('[name="body"]');
+    check('the details open in the rich editor', Boolean(edit.querySelector('.kb-rich .toastui-editor-ww-container')) && bodyArea.hidden);
+    check('its toolbar never submits the form', [...edit.querySelectorAll('.toastui-editor-toolbar button')].every((b) => b.type === 'button'));
+    const before = bodyArea.value;
+    k.rich(bodyArea).setMarkdown(`${k.rich(bodyArea).getMarkdown().trimEnd()}\n\nTyped in the editor.`);
+    eq('an edit reaches the form, the rest of the body as it was', bodyArea.value, `${before.trimEnd()}\n\nTyped in the editor.\n`);
+    bodyArea.value = before;
     edit.querySelector('[name="title"]').value = 'My local title';
     edit.querySelector('[name="body"]').value = 'My local body';
     const incomingFiles = k.applyChange(files, { op: 'save', card: 1, title: 'Remote title', column: 'doing',
@@ -309,6 +346,7 @@
     decide('field:depends_on', 'accept');
     eq('Decline keeps the local field', edit.querySelector('[name="title"]').value, 'My local title');
     eq('Accept updates the body and status', [edit.querySelector('[name="body"]').value, edit.querySelector('[name="column"]').value], ['Remote body\n', 'doing']);
+    eq('and shows the body in the editor', k.rich(bodyArea).getMarkdown().trim(), 'Remote body');
     eq('Accept updates multiselects and card references', [[...edit.querySelectorAll('[name="roles"]:checked')].map(el => el.value), edit.querySelector('[name="depends_on"]').value], [['switch'], 'DEMO-3']);
     check('Save enabled after all decisions', !document.querySelector('[form="card-form"][type="submit"]').disabled);
     k.accept({ ...data, version: 'incoming-repeat', files: incomingFiles });

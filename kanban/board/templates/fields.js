@@ -34,18 +34,10 @@ KanbanTemplates.partials.fieldInputs = /*html*/ `
 </div>
 `;
 
-// The details, in Markdown: written in one tab, previewed in the other. Data: body.
+// The details, in Markdown. app.js mounts the rich editor (Toast UI) over the textarea,
+// which stays the value the form sends. Data: body, bind (the settings draft's path).
 KanbanTemplates.partials.markdownEditor = /*html*/ `
-<div class="tabs kb-editor">
-  <nav role="tablist" aria-orientation="horizontal">
-    <button type="button" role="tab" id="tab-write" aria-controls="panel-write" aria-selected="true" tabindex="0">Write</button>
-    <button type="button" role="tab" id="tab-preview" aria-controls="panel-preview" aria-selected="false" tabindex="-1">Preview</button>
-  </nav>
-  <div role="tabpanel" id="panel-write" aria-labelledby="tab-write">
-    <textarea class="textarea kb-body" name="body" aria-label="Details, in Markdown" spellcheck="true" {{#bind}}data-bind="{{bind}}"{{/bind}}>{{body}}</textarea>
-  </div>
-  <div role="tabpanel" id="panel-preview" aria-labelledby="tab-preview" hidden>
-    <article class="kb-markdown" data-preview></article>
-  </div>
+<div class="kb-editor">
+  <textarea class="textarea kb-body" name="body" aria-label="Details, in Markdown" spellcheck="true" {{#bind}}data-bind="{{bind}}"{{/bind}}>{{body}}</textarea>
 </div>
 `;

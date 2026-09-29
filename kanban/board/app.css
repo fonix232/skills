@@ -184,6 +184,36 @@ body { background: var(--background); color: var(--foreground); }
 .kb-form { display: flex; flex-direction: column; gap: 1rem; }
 .kb-body { font-family: var(--font-mono); font-size: 0.8125rem; min-height: 22rem; }
 
+/* The rich editor (Toast UI), in the board's theme. Its textarea stays hidden, as the form's
+   value. */
+.kb-rich .toastui-editor-defaultUI { border-color: var(--border); border-radius: calc(var(--radius) - 2px); background: var(--card); overflow: hidden; }
+.kb-rich .toastui-editor-defaultUI-toolbar { background: var(--muted); border-bottom-color: var(--border); padding: 0 0.5rem; }
+.kb-rich .toastui-editor-toolbar-divider { background-color: var(--border); }
+.kb-rich .toastui-editor-defaultUI-toolbar button { border-color: transparent; border-radius: calc(var(--radius) - 4px); }
+.kb-rich .toastui-editor-defaultUI-toolbar button:not(:disabled):hover { background-color: var(--accent); border-color: var(--border); }
+.kb-rich .toastui-editor-mode-switch { background: var(--muted); border-top-color: var(--border); }
+.kb-rich .toastui-editor-mode-switch .tab-item { background: var(--muted); border-color: var(--border); color: var(--muted-foreground); }
+.kb-rich .toastui-editor-mode-switch .tab-item.active { background: var(--card); color: var(--foreground); border-top-color: var(--card); }
+.kb-rich .toastui-editor-main, .kb-rich .toastui-editor-ww-container, .kb-rich .toastui-editor-md-container { background: var(--card); }
+.kb-rich .toastui-editor-contents, .kb-rich .ProseMirror { font-family: inherit; font-size: 0.875rem; line-height: 1.6; color: var(--foreground); }
+.kb-rich .toastui-editor-contents :is(h1, h2, h3, h4) { color: var(--foreground); border-bottom: 0; font-weight: 600; line-height: 1.3; margin: 1.25em 0 0.5em; padding: 0; }
+.kb-rich .toastui-editor-contents h1 { font-size: 1.25rem; }
+.kb-rich .toastui-editor-contents h2 { font-size: 1.0625rem; }
+.kb-rich .toastui-editor-contents h3 { font-size: 0.9375rem; }
+.kb-rich .toastui-editor-contents > :first-child { margin-top: 0; }
+.kb-rich .toastui-editor-contents :is(p, li) { color: var(--foreground); }
+.kb-rich .toastui-editor-contents a { color: var(--primary); }
+.kb-rich .toastui-editor-contents :is(code, pre) { background: var(--muted); color: var(--foreground); }
+.kb-rich .toastui-editor-contents blockquote { border-left-color: var(--border); }
+.kb-rich .toastui-editor-contents blockquote p { color: var(--muted-foreground); }
+.kb-rich .toastui-editor-contents :is(th, td) { border-color: var(--border); }
+.kb-rich .toastui-editor-contents th { background: var(--muted); color: var(--foreground); }
+.kb-rich .toastui-editor-contents ul > li::before { background-color: var(--muted-foreground); }
+.kb-rich .toastui-editor-contents .task-list-item::before { border-color: var(--muted-foreground); border-radius: 3px; }
+.kb-rich .toastui-editor-contents .task-list-item.checked::before { background-color: var(--primary); border-color: var(--primary); }
+.kb-rich .toastui-editor-md-container .ProseMirror { font-family: var(--font-mono); font-size: 0.8125rem; }
+.kb-rich .toastui-editor-popup, .kb-rich .toastui-editor-context-menu { background: var(--popover); color: var(--popover-foreground); border-color: var(--border); }
+
 /* Rendered Markdown: the card's details. */
 .kb-markdown { font-size: 0.875rem; line-height: 1.6; overflow-wrap: anywhere; }
 .kb-markdown > :first-child { margin-top: 0; }
@@ -227,6 +257,11 @@ body { background: var(--background); color: var(--foreground); }
 
 /* The board settings editor. */
 .kb-settings-tabs { display: flex; gap: 0.25rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+/* The settings dialog keeps one height whichever tab is open; a long tab scrolls under its
+   tabs. */
+.kb-settings-modal > div { height: min(46rem, 92vh); }
+.kb-settings-modal .kb-modal-body { flex: 1; background: inherit; }
+.kb-settings-modal .kb-settings-tabs { position: sticky; top: 0; z-index: 2; background: inherit; }
 .kb-settings-pane { display: flex; flex-direction: column; gap: 0.75rem; }
 .kb-settings-pane > .btn { align-self: flex-start; }
 .kb-settings-errors { margin-bottom: 1rem; }
