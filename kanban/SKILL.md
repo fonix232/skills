@@ -19,6 +19,10 @@ agent edits the Markdown files; the server never applies a change to them.
   <column>/            one folder per column, named by the column's id
     _<column>.md       the column's cards in order: a numbered list of links, top first
     012-password-reset-by-email.md
+  attachments/
+    <KEY>-<n>/         a card's images (PNG, JPEG, WebP, GIF), such as proof screenshots
+  <level>/             optional: the documents above the cards (see `levels`), such as
+    I1-<slug>.md       initiatives/ and epics/
 ```
 
 **board.yml** (start from `templates/board.yml`):
@@ -35,7 +39,17 @@ agent edits the Markdown files; the server never applies a change to them.
     - `variant` is a badge style (`primary`, `secondary`, `destructive`, `outline`), for options without a colour.
   - `tile: true` shows the field on the card's tile, as badges.
   - `marker: true` (on one field, usually the priority) colours the tile's left border with the value's `color`.
+  - `scope: true` (on one `select` field, usually the milestone) makes it the board's scope. The board shows it as swimlanes: one row of columns per value, plus one for cards without a value. A picker in the top bar shows one lane at a time or every lane; with every lane shown, the current value's lane starts open and the others folded, and the viewer can fold or open each one (remembered in that browser). The column counts follow the picker.
+    - The option marked `current: true` is shown by default. Move the flag when the next milestone starts.
+    - `?scope=<value>` in the address picks another value, and the picker keeps its choice there: `*` is every card, `-` the cards without a value.
+    - A card created while a value is shown starts with it.
 - `template`: the Markdown a new card starts with.
+- `levels` (optional): the documents above the cards, such as initiatives and then epics, shown in the page's outline view next to the board. Each level is `{ id, title, parent, field }`:
+  - `id` is the level's folder in the board, holding one Markdown document per item, with `id`, `title` and `status` in its front matter (`draft`, `reviewed`, `approved`, `in-progress`, `done` get colours);
+  - `parent` (every level but the first) names the front matter key that holds the parent level's document ID (`initiative: I1`);
+  - `field` (the last level) names the card field that holds the document's ID (`epic: E1.2`).
+
+  The outline shows the tree with each document's status and the share of its cards in the last column, and lists the cards under their document; cards in none are listed apart. The scope picker filters it too: a document shows when its front matter carries the value (`milestone: M1`, or a list in `milestones`), or its cards do. Documents open read-only; the agent writes them. The settings editor keeps `levels` as they are.
 
 The page's **Board** button edits all of this visually: columns (order, titles, folders), fields (order, kind, tile and marker, help, and options with labels and colours from the palette) and the template. It writes `board.yml` through a `config` change. Comments in `board.yml` don't survive an edit on the page.
 
@@ -74,6 +88,7 @@ What's done, what's verified and how, and what's left. Rewrite it; git has the h
 
 - Front matter keys go in this order: `id`, `title`, the board's fields in `board.yml` order, then `created`. Lists are written inline (`[a, b]`), and empty fields are left out.
 - The body is Markdown (GitHub's flavour). A ticket number in it (`APP-7`) links to that card on the page.
+- Images go in `attachments/<KEY>-<n>/` and the card links them as `![What it shows](../attachments/APP-12/reset-form.png)`, a path that works from any column on GitHub too. The page shows them; the server serves image files from that folder and nothing else from the repository. Keep them few and small (a few hundred KB each), and commit them with the card.
 - A card is a story. Its **acceptance criteria** say when it's done. Its **tasks** are the work, broken down, in the order it's done. Both are task lists (`- [ ]`) under their `##` headings. The page counts them into the tile's progress bar, and it can tick them and drag them into another order within their list.
 - A card's number is never used twice: a new card gets one more than the highest number the board has had, deleted cards included (`git log` knows them).
 - The file name keeps its first title. Renaming a card doesn't rename its file.
@@ -139,7 +154,7 @@ curl -fsS http://127.0.0.1:8124/api/changes
 The page sends `POST /api/changes` with a JSON body. The server acknowledges it only after
 committing it to `.ai/local/kanban/inbox.sqlite3`; retries with the same change ID are
 idempotent. Changes remain pending until the agent explicitly acknowledges application.
-The page distinguishes Not delivered, Queued for agent, Needs resolution and Applied.
+The page distinguishes Not delivered, Queued for agent, Needs resolution, Applied and Cancelled.
 A failed poll shows that the board may be out of date. Delivery failures show a Retry button; the browser retains pending changes across reloads
 when storage is available. The request limit is 8 MiB; oversized changes show an error.
 Do not delete or truncate the inbox. `server.log` is diagnostic output, never a queue.
@@ -165,6 +180,9 @@ curl -fsS -H 'Content-Type: application/json' \
   -d '{"id":"CHANGE_ID"}' http://127.0.0.1:8124/api/check-change
 ```
 
+- If `cancelled` is true, the user withdrew the change on the dashboard: skip it, and never
+  apply or acknowledge it. `GET /api/changes` no longer lists it, and a cancelled
+  prerequisite no longer blocks anything.
 - If `blocked_by` is nonempty, finish those prerequisite changes first.
 - If `already_written` is true, verify the complete result and acknowledge it without
   replaying toggles or creates; this handles a previous session stopping before acknowledgement.
@@ -207,6 +225,16 @@ New arrivals remain in the inbox during acknowledgement; nothing is truncated. T
 poll clears pending indicators even if the board's contents ended up unchanged. Refresh
 the board README before committing. Dashboard edits are board upkeep: do not commit them
 unless the user asks for a commit or push.
+If the acknowledgement is refused because a change was cancelled, the user withdrew it while
+you were applying it: restore each touched path from its `before` snapshot (delete it when
+`before` is `null`), merging any edits made since, and don't acknowledge it.
+
+**Cancelling.** The page's bell lists the changes waiting for the agent, each with **Cancel**
+(their toasts have it too). `POST /api/cancel` with `{"ids":[...]}` (and `"dry_run": true` to
+only ask) cancels them with every later pending change that touches one of their files,
+since those changes' contents were built on them, and returns `cancelled`, `summaries` and
+`paths`. Applied changes can't be cancelled. The page asks before cancelling more than the one
+picked. The server keeps cancelled changes as tombstones, so a late retry stays cancelled.
 
 **Stop** only the server started for this board. Read `server.pid`, verify that the PID's
 command is this server with the expected board/view arguments, then send it SIGTERM.

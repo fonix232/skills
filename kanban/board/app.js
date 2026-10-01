@@ -30,8 +30,22 @@
     board: null,
     pending: [],
     query: '',
+    // The board scope's value chosen in the address or on the page; null follows the board
+    // (the option marked `current`). See scopeValue().
+    scope: new URLSearchParams(location.search).get('scope'),
+    // Which view shows: the columns ('board') or the outline of the board's levels.
+    view: new URLSearchParams(location.search).get('view') === 'outline' ? 'outline' : 'board',
+    // Swimlanes the viewer folded or unfolded, by lane value; loaded per board (see lanes()).
+    lanes: null,
+    folded: null, // outline documents folded, by path; loaded per board (see folded())
     modal: null, // { kind: 'card', id, editing } or { kind: 'new' }
     sortables: [],
+    cancelling: false, // a cancellation is on its way to the server
+    cancelError: '',
+    bellOpen: false, // the notifications drop-down is open
+    history: [], // what the toasts said, newest first (notify); the drop-down's Recent list
+    dragging: false, // a card is being dragged; a redraw waits for the drop (redraw)
+    redraw: false,
     followed: false,
     restored: false,
     delivery: {},
@@ -106,6 +120,9 @@
           out.push(`      - ${Object.keys(clean).length === 1 ? yamlValue(clean.value) : flow(clean)}`);
         }
       }
+    }
+    if (c.levels && c.levels.length) {
+      out.push('', 'levels:', ...c.levels.map((l) => `  - ${flow(Object.fromEntries(Object.entries(l).filter(([, v]) => !isEmpty(v))))}`));
     }
     const t = String(c.template || '').replace(/\s+$/, '');
     out.push('', t ? `template: |${/^\s/.test(t) ? '2' : ''}` : "template: ''", ...(t ? t.split('\n').map((l) => (l ? `  ${l}` : '')) : []));
@@ -255,6 +272,8 @@
         options: (f.options || []).map((o) => (o && typeof o === 'object' ? { ...o, value: String(o.value) } : { value: String(o) })),
       })),
       template: c.template || '',
+      // The outline above the cards: each level is a folder of Markdown documents in the board.
+      levels: (Array.isArray(c.levels) ? c.levels : []).filter((l) => l && l.id).map((l) => ({ ...l, id: String(l.id), title: String(l.title || l.id) })),
     };
   }
 
@@ -444,6 +463,51 @@
     }
   }
 
+  // Withdraws a change waiting for the agent. The server cancels it with every later change
+  // to the same files (their contents were built on it), after asking when there are any; the
+  // board then shows the files without them. Everything is delivered first, so the server
+  // knows each change it's asked about.
+  async function cancelChange(id) {
+    if (!LIVE || S.cancelling) return;
+    S.cancelling = true;
+    try {
+      await sendPending();
+      if (S.pending.some((c) => S.delivery[c.id] !== 'queued')) throw new Error('some changes haven\'t reached the server yet. Retry delivery first');
+      const plan = await post('api/cancel', { ids: [id], dry_run: true });
+      if (plan.cancelled.length > 1) askCancel(id, plan);
+      else await cancelNow(plan.cancelled.length ? plan.cancelled : [id]);
+    } catch (error) {
+      cancelFailed(error);
+    } finally {
+      S.cancelling = false;
+    }
+  }
+
+  async function cancelNow(ids) {
+    const result = await post('api/cancel', { ids });
+    const gone = new Set(result.cancelled);
+    S.cancelError = '';
+    accept({ ...S.data, queue: (S.data?.queue || []).filter((row) => !gone.has(row.id)), cancelled: [...(S.data?.cancelled || []), ...result.cancelled] });
+  }
+
+  function cancelFailed(error) {
+    const old = /\((404|501)\)/.test(error.message);
+    S.cancelError = old
+      ? 'This board\'s server predates cancelling. Restart serve.py to cancel changes.'
+      : `The change couldn't be cancelled: ${error.message}.`;
+    render();
+  }
+
+  function askCancel(id, plan) {
+    const d = $('#confirm');
+    const count = plan.cancelled.length;
+    d.innerHTML = `<div>${Mustache.render(T.confirmCancel, {
+      count, ids: plan.cancelled.join(' '), first: plan.summaries[id] || 'This change',
+      later: plan.cancelled.filter((i) => i !== id).map((i) => plan.summaries[i] || i),
+    }, T.partials)}</div>`;
+    d.showModal();
+  }
+
   // Applies a change on the page and hands it to the agent.
   function commit(op, fields, summary, sourceFiles = null) {
     if (!LIVE) return;
@@ -479,8 +543,9 @@
       } catch { S.storageError = 'The saved browser outbox could not be read. Keep this page open and check the server inbox.'; }
     }
     const applied = new Set(data.applied || []);
+    const cancelled = new Set(data.cancelled || []);
     S.lastApplied += S.pending.filter((c) => applied.has(c.id)).length;
-    S.pending = S.pending.filter((c) => !applied.has(c.id));
+    S.pending = S.pending.filter((c) => !applied.has(c.id) && !cancelled.has(c.id));
     let files = { ...(data.files || {}) };
     S.replayError = '';
     for (const c of S.pending) {
@@ -513,11 +578,13 @@
     s.onerror = failed;
     s.onload = () => {
       clearTimeout(timeout); S.polling = false;
+      const wasLost = S.connectionError !== '';
       S.connectionError = '';
       s.remove();
       const d = window.KANBAN_DATA;
-      if (d && (d.version !== S.data?.version || JSON.stringify(d.applied || []) !== JSON.stringify(S.data?.applied || []) || JSON.stringify(d.queue || []) !== JSON.stringify(S.data?.queue || []))) accept(d);
-      else render();
+      // An unchanged board isn't drawn again: redrawing every poll loses the reader's place.
+      if (d && (d.version !== S.data?.version || JSON.stringify(d.applied || []) !== JSON.stringify(S.data?.applied || []) || JSON.stringify(d.queue || []) !== JSON.stringify(S.data?.queue || []) || (d.cancelled || []).length !== (S.data?.cancelled || []).length)) accept(d);
+      else if (wasLost) render();
     };
     document.head.append(s);
   }
@@ -556,6 +623,45 @@
     return { color: '', label: '' };
   }
 
+  // The board's scope: the first select field with `scope: true`, usually the milestone. The
+  // page shows one of its values at a time: the one picked on the page or in the address
+  // (?scope=M2), else the option marked `current: true`, else every card. `*` is every card
+  // and `-` the cards without a value.
+  const ALL = '*';
+  const NONE = '-';
+  const scopeField = () => S.board.config.fields.find((f) => f.scope && f.kind === 'select');
+
+  function scopeValue() {
+    const f = scopeField();
+    if (!f) return ALL;
+    if (S.scope !== null && S.scope !== '') return S.scope;
+    return f.options.find((o) => o.current)?.value ?? ALL;
+  }
+
+  function inScope(card) {
+    const f = scopeField();
+    const want = scopeValue();
+    if (!f || want === ALL) return true;
+    const v = fieldValues(f, card.meta[f.name])[0];
+    return want === NONE ? v === undefined : v === want;
+  }
+
+  function scopeView() {
+    const f = scopeField();
+    if (!f) return null;
+    const want = scopeValue();
+    const known = [ALL, NONE, ...f.options.map((o) => o.value)];
+    return {
+      label: f.label,
+      options: [
+        { value: ALL, text: `Every ${f.label.toLowerCase()}`, selected: want === ALL },
+        ...f.options.map((o) => ({ value: o.value, text: `${o.label || o.value}${o.current ? ' (current)' : ''}`, selected: want === o.value })),
+        ...(known.includes(want) ? [] : [{ value: want, text: want, selected: true }]),
+        { value: NONE, text: `No ${f.label.toLowerCase()}`, selected: want === NONE },
+      ],
+    };
+  }
+
   function tileView(card) {
     const badges = [];
     for (const f of S.board.config.fields.filter((x) => x.tile)) {
@@ -579,29 +685,181 @@
       depends,
       search,
       pending,
+      outOfScope: !inScope(card),
       marker: marker.color,
       markerLabel: marker.label,
     };
   }
 
+  // Swimlanes: one per value of the scope field (a milestone each), plus one for cards without
+  // a value. With every value shown, the current one is open and the others folded, unless the
+  // viewer folded or opened them; with one value picked, only its lane shows, open.
+  const lanesKey = () => `kanban-lanes:${S.data?.boardId || location.pathname}`;
+
+  function lanes() {
+    if (S.lanes === null) {
+      try {
+        S.lanes = JSON.parse(localStorage.getItem(lanesKey()) || '{}') || {};
+      } catch {
+        S.lanes = {};
+      }
+    }
+    return S.lanes;
+  }
+
+  function toggleLane(value, open) {
+    lanes()[value] = !open;
+    try {
+      localStorage.setItem(lanesKey(), JSON.stringify(S.lanes));
+    } catch {}
+    render();
+  }
+
+  // Outline documents the viewer folded, by path; kept per board like the lanes.
+  const foldedKey = () => `kanban-outline:${S.data?.boardId || location.pathname}`;
+
+  function folded() {
+    if (S.folded === null) {
+      try {
+        S.folded = JSON.parse(localStorage.getItem(foldedKey()) || '{}') || {};
+      } catch {
+        S.folded = {};
+      }
+    }
+    return S.folded;
+  }
+
+  function toggleNode(path, open) {
+    if (open) delete folded()[path];
+    else folded()[path] = true;
+    try {
+      localStorage.setItem(foldedKey(), JSON.stringify(S.folded));
+    } catch {}
+    render();
+  }
+
+  const cardsText = (n) => `${n} card${n === 1 ? '' : 's'}`;
+
+  function lanesView() {
+    const f = scopeField();
+    const cell = (lane, match) => S.board.columns.map((col) => ({ column: col.id, lane, cards: col.cards.filter(match).map(tileView) }));
+    if (!f) return [{ value: '', header: false, collapsed: false, cells: cell('', () => true) }];
+    const want = scopeValue();
+    const valueOf = (card) => fieldValues(f, card.meta[f.name])[0];
+    const extra = [...new Set([...S.board.cards.values()].map(valueOf).filter((v) => v !== undefined && !f.options.some((o) => o.value === v)))];
+    const all = [
+      ...f.options.map((o) => ({ value: o.value, label: o.label || o.value, current: Boolean(o.current), always: true })),
+      ...extra.map((v) => ({ value: v, label: v, current: false, always: false })),
+      { value: NONE, label: `No ${f.label.toLowerCase()}`, current: false, always: false },
+    ];
+    return all
+      .map((l) => {
+        const cells = cell(l.value, (card) => (l.value === NONE ? valueOf(card) === undefined : valueOf(card) === l.value));
+        const count = cells.reduce((n, c) => n + c.cards.length, 0);
+        const stored = lanes()[l.value];
+        const collapsed = want === ALL ? (stored === undefined ? !l.current : stored) : false;
+        // Each column's count in this lane, for the headers while the lane is under them.
+        const counts = JSON.stringify(Object.fromEntries(cells.map((c) => [c.column, c.cards.length])));
+        return { ...l, header: true, count, countText: cardsText(count), collapsed, cells, counts };
+      })
+      .filter((l) => (want === ALL ? l.always || l.count > 0 : l.value === want));
+  }
+
+  // The outline: the board's levels (initiatives, then epics, say), each a folder of Markdown
+  // documents in the board with `id`, `title` and `status` in their front matter. A level's
+  // `parent` names the front matter key that points at its parent level's document; the last
+  // level's `field` is the card field that points at it.
+  const STATUS_COLORS = { draft: 'gray', proposed: 'gray', planned: 'gray', reviewed: 'blue', approved: 'blue', 'in-progress': 'amber', active: 'amber', closing: 'amber', done: 'green', closed: 'green', superseded: 'gray' };
+
+  function levelDocs(level) {
+    const prefix = `${level.id}/`;
+    return Object.entries(S.files)
+      .filter(([path]) => path.startsWith(prefix) && path.endsWith('.md') && !path.slice(prefix.length).includes('/') && !path.slice(prefix.length).startsWith('_'))
+      .map(([path, text]) => {
+        const { meta, body } = parseCard(text);
+        const id = String(meta.id ?? path.slice(prefix.length, -3));
+        return { id, title: String(meta.title ?? id), status: isEmpty(meta.status) ? '' : String(meta.status), meta, body, path, level };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
+  }
+
+  function outlineView() {
+    const levels = S.board.config.levels;
+    const f = scopeField();
+    const want = scopeValue();
+    const doneColumn = S.board.columns.at(-1)?.id;
+    const last = levels.length - 1;
+    const link = levels[last].field;
+    const docs = levels.map(levelDocs);
+    const cards = [...S.board.cards.values()];
+    const linked = (card) => (link ? fieldValues({}, card.meta[link])[0] : undefined);
+    const docScoped = (doc) => {
+      if (!f || want === ALL) return true;
+      const v = [...fieldValues({}, doc.meta[f.name]), ...fieldValues({}, doc.meta[`${f.name}s`])];
+      return want === NONE ? v.length === 0 : v.includes(want);
+    };
+    const storyView = (c) => ({ id: c.id, ticket: ticketOf(c.id), title: c.title, columnTitle: S.board.columns.find((col) => col.id === c.column)?.title || c.column, done: c.column === doneColumn });
+    const progress = (list) => {
+      const done = list.filter((c) => c.column === doneColumn).length;
+      return { done, total: list.length, pct: list.length ? Math.round((done / list.length) * 100) : 0 };
+    };
+    // With one scope value picked, a last-level document shows when it carries that value or
+    // has cards in it; a higher one shows when any of its children does.
+    const filtering = Boolean(f) && want !== ALL;
+    const node = (doc, depth) => {
+      const childLevel = levels[depth + 1];
+      const children = childLevel ? docs[depth + 1].filter((d) => String(d.meta[childLevel.parent] ?? '') === doc.id).map((d) => node(d, depth + 1)).filter(Boolean) : [];
+      const own = depth === last ? cards.filter((c) => linked(c) === doc.id) : [];
+      const stories = own.filter(inScope);
+      if (filtering && (depth === last ? !(docScoped(doc) || stories.length) : children.length === 0)) return null;
+      const all = [...own, ...children.flatMap((ch) => ch.cardList)];
+      const collapsible = stories.length > 0 || children.length > 0;
+      return {
+        id: doc.id, title: doc.title, path: doc.path, depth, levelTitle: doc.level.title,
+        collapsible, collapsed: collapsible && Boolean(folded()[doc.path]),
+        status: doc.status, statusColor: `var(--kb-${STATUS_COLORS[doc.status] || 'gray'})`,
+        progress: progress(all), cardList: all,
+        stories: stories.map(storyView), children,
+      };
+    };
+    // Top level: the first level's documents, then any lower-level ones whose parent is missing.
+    const orphan = (depth, doc) => !docs[depth - 1].some((p) => p.id === String(doc.meta[levels[depth].parent] ?? ''));
+    const roots = docs.flatMap((list, depth) => list.filter((d) => depth === 0 || orphan(depth, d)).map((d) => node(d, depth))).filter(Boolean);
+    const loose = cards.filter((c) => inScope(c) && !docs[last].some((d) => d.id === linked(c)));
+    return {
+      roots,
+      empty: roots.length === 0 && loose.length === 0,
+      loose: loose.map(storyView),
+      looseCount: cardsText(loose.length),
+      looseTitle: `Not in any ${levels[last].title.replace(/s$/i, '').toLowerCase()}`,
+      folders: levels.map((l) => l.id).join('/, ') + '/',
+    };
+  }
+
   function dashboardView() {
     const c = S.board.config;
+    const outline = S.view === 'outline' && c.levels.length > 0;
     return {
       name: c.name,
       key: c.key,
       query: S.query,
+      scope: scopeView(),
+      views: c.levels.length ? { board: !outline, outline, label: c.levels.map((l) => l.title).join(' & ') } : null,
+      outline: outline ? outlineView() : null,
+      lanes: outline ? [] : lanesView(),
+      hasLanes: Boolean(scopeField()),
+      columnCount: S.board.columns.length,
       editable: LIVE,
       pending: { count: changeStatuses().length, list: changeStatuses() },
-      connectionError: S.connectionError, lastApplied: S.lastApplied,
-      deliveryError: S.deliveryError, storageError: S.storageError, replayError: S.replayError,
-      columns: S.board.columns.map((col) => ({ id: col.id, title: col.title, count: col.cards.length, cards: col.cards.map(tileView) })),
+      bell: { open: S.bellOpen, recent: S.history.map((n) => ({ ...n, time: new Date(n.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })) },
+      columns: S.board.columns.map((col) => ({ id: col.id, title: col.title, count: col.cards.filter(inScope).length, cards: col.cards.map(tileView) })),
     };
   }
 
   function changeStatuses() {
     const queued = S.data?.queue || [];
     const rows = new Map(queued.map(row => [row.id, { ...row, summary: row.reason ? `${row.summary}: ${row.reason}` : row.summary }]));
-    for (const event of S.pending) if (!rows.has(event.id)) rows.set(event.id, { summary: event.summary,
+    for (const event of S.pending) if (!rows.has(event.id)) rows.set(event.id, { id: event.id, summary: event.summary,
       status: S.replayError ? 'Needs resolution' : S.delivery[event.id] === 'queued' ? 'Queued for agent' : 'Not delivered' });
     return [...rows.values()];
   }
@@ -713,7 +971,7 @@
       key: cfg.key,
       nextTicket: ticketOf(nextId()),
       columns: columnOptions(column || cfg.columns[0]?.id),
-      fields: cfg.fields.map((f) => fieldInputView(f, f.default)),
+      fields: cfg.fields.map((f) => fieldInputView(f, f === scopeField() && ![ALL, NONE].includes(scopeValue()) ? scopeValue() : f.default)),
       body: cfg.template,
     };
   }
@@ -727,6 +985,13 @@
     const html = DOMPurify.sanitize(marked.parse(String(md || ''), { gfm: true }));
     const tpl = document.createElement('template');
     tpl.innerHTML = html;
+    // A card's images live in the board's attachments/ folder and are linked from the card
+    // as ../attachments/<KEY>-<n>/<file>; the server serves that folder at /attachments/.
+    tpl.content.querySelectorAll('img').forEach((img) => {
+      const m = /^(?:\.\.\/)?(attachments\/[^?#]+)$/.exec(img.getAttribute('src') || '');
+      if (m) img.setAttribute('src', m[1]);
+      img.setAttribute('loading', 'lazy');
+    });
     const boxes = [...tpl.content.querySelectorAll('input[type="checkbox"]')];
     boxes.forEach((cb, n) => {
       cb.dataset.task = String(n);
@@ -914,15 +1179,27 @@
       app.innerHTML = Mustache.render(T.noData, {}, T.partials);
       return;
     }
-    const scroll = [...document.querySelectorAll('.kb-cards')].map((el) => [el.dataset.column, el.scrollTop]);
-    const boardScroll = $('.kb-board')?.scrollLeft || 0;
+    // A card being dragged would be dropped by redrawing: draw once the drag ends.
+    if (S.dragging) { S.redraw = true; return; }
+    // Every scrolling area keeps its place across a redraw: the board (both ways, it scrolls
+    // vertically with swimlanes), the outline, each lane's list, and the page itself.
+    const listKey = (el) => `${el.dataset.column}\u0000${el.dataset.lane ?? ''}`;
+    const lists = new Map([...document.querySelectorAll('.kb-cards')].map((el) => [listKey(el), el.scrollTop]));
+    const areas = ['.kb-board', '.kb-outline', '.kb-bell-panel'].map((sel) => [sel, $(sel)?.scrollTop || 0, $(sel)?.scrollLeft || 0]);
+    const page = [window.scrollX, window.scrollY];
     const focused = document.activeElement?.dataset?.action === 'filter';
+    const bellFocused = document.activeElement?.dataset?.action === 'bell';
+    syncToasts(); // first: it records what the bell's drop-down lists
     app.innerHTML = Mustache.render(T.dashboard, dashboardView(), T.partials);
-    for (const [col, top] of scroll) {
-      const el = $(`.kb-cards[data-column="${CSS.escape(col)}"]`);
-      if (el) el.scrollTop = top;
+    for (const [sel, top, left] of areas) {
+      const el = $(sel);
+      if (el) { el.scrollTop = top; el.scrollLeft = left; }
     }
-    if ($('.kb-board')) $('.kb-board').scrollLeft = boardScroll;
+    document.querySelectorAll('.kb-cards').forEach((el) => {
+      if (lists.has(listKey(el))) el.scrollTop = lists.get(listKey(el));
+    });
+    window.scrollTo(page[0], page[1]);
+    if (bellFocused) $('[data-action="bell"]')?.focus();
     if (focused) {
       const input = $('[data-action="filter"]');
       input.focus();
@@ -931,13 +1208,52 @@
     applyFilter();
     bindSortables();
     showDeliveryError();
+    $('.kb-board')?.addEventListener('scroll', updateHeaderCounts, { passive: true });
+    updateHeaderCounts();
+  }
+
+  // While a swimlane is under the sticky column headers, each header counts that lane's cards
+  // out of the column's, as "20/50"; above the first lane, and with one lane, the column's alone.
+  function updateHeaderCounts() {
+    const board = $('.kb-board.kb-has-lanes');
+    if (!board) return;
+    const edge = $('.kb-board-head', board).getBoundingClientRect().bottom;
+    const lanes = [...board.querySelectorAll('.kb-lane')];
+    const lane = lanes.length > 1 ? lanes.find((el) => {
+      const r = el.getBoundingClientRect();
+      return r.top < edge && r.bottom > edge;
+    }) : null;
+    let counts = {};
+    try { counts = lane ? JSON.parse(lane.dataset.counts || '{}') : {}; } catch {}
+    board.querySelectorAll('.kb-column').forEach((col) => {
+      const badge = $('.kb-column-count', col);
+      if (!badge) return;
+      const total = badge.dataset.total;
+      const n = lane ? counts[col.dataset.column] ?? 0 : null;
+      const text = n === null ? total : `${n}/${total}`;
+      if (badge.textContent !== text) badge.textContent = text;
+      if (n === null) badge.removeAttribute('title');
+      else badge.title = `${n} of ${total} cards in ${lane.dataset.label}`;
+    });
   }
 
   function applyFilter() {
     const q = S.query.trim().toLowerCase();
     document.querySelectorAll('.kb-tile').forEach((el) => {
-      el.classList.toggle('kb-hidden', q !== '' && !q.split(/\s+/).every((w) => el.dataset.search.includes(w)));
+      const unmatched = q !== '' && !q.split(/\s+/).every((w) => el.dataset.search.includes(w));
+      el.classList.toggle('kb-hidden', el.dataset.out === '1' || unmatched);
     });
+  }
+
+  // Where a dropped card goes in its column's whole order: before the card it was dropped
+  // above, after the one it was dropped below, else last. A swimlane shows only part of a
+  // column, so its list's own position isn't the column's.
+  function dropIndex(column, id, nextId, prevId) {
+    const others = S.board.columns.find((c) => c.id === column).cards.filter((c) => c.id !== id);
+    const at = (n) => others.findIndex((c) => c.id === n);
+    if (nextId !== null && at(nextId) >= 0) return at(nextId);
+    if (prevId !== null && at(prevId) >= 0) return at(prevId) + 1;
+    return others.length;
   }
 
   function bindSortables() {
@@ -947,17 +1263,24 @@
     document.querySelectorAll('.kb-cards').forEach((list) => {
       S.sortables.push(
         Sortable.create(list, {
-          group: 'cards',
+          group: `cards-${list.dataset.lane || ''}`,
           animation: 150,
           ghostClass: 'kb-ghost',
           chosenClass: 'kb-chosen',
           filter: '.kb-hidden',
+          onStart: () => { S.dragging = true; },
           onEnd: (e) => {
+            S.dragging = false;
+            if (S.redraw) { S.redraw = false; queueMicrotask(render); }
             const id = Number(e.item.dataset.id);
             const column = e.to.dataset.column;
-            // The index among the column's cards, counting the ones the filter hides.
-            const index = [...e.to.children].indexOf(e.item);
             const card = S.board.cards.get(id);
+            const near = (dir) => {
+              let el = e.item[dir];
+              while (el && !el.matches('.kb-tile')) el = el[dir];
+              return el ? Number(el.dataset.id) : null;
+            };
+            const index = dropIndex(column, id, near('nextElementSibling'), near('previousElementSibling'));
             if (!card || (card.column === column && S.board.columns.find((c) => c.id === column).cards.indexOf(card) === index)) return;
             const title = S.board.columns.find((c) => c.id === column)?.title || column;
             commit('move', { card: id, column, index }, card.column === column ? `Reorder ${ticketOf(id)} in ${title}` : `Move ${ticketOf(id)} to ${title}`);
@@ -982,6 +1305,122 @@
         },
       });
     });
+  }
+
+  // ---------------------------------------------------------------- toasts
+
+  // Changes and problems show as toasts in the top right corner, outside #app, so a redraw
+  // leaves them alone. A change's toast follows it (not delivered, queued, applied) and goes
+  // TOAST_MS after its last update, held while the pointer is on it; a problem's toast stays
+  // until the problem clears. A toast closed by hand comes back only when what it says changes.
+  const TOAST_MS = 15000;
+  const HISTORY = 30;
+  const TOASTS = new Map(); // key -> { el, sticky, timer }, the toasts on screen
+  const SHOWN = new Map(); // key -> what its toast last said
+  const TRACKED = new Map(); // change id -> summary, the changes with a toast to follow
+
+  function notify(key, { title, text = '', tone = 'info', sticky = false, action = null }) {
+    const said = JSON.stringify([title, text, tone, action]);
+    if (SHOWN.get(key) === said) return;
+    SHOWN.set(key, said);
+    S.history = [{ title, text, tone, at: Date.now() }, ...S.history].slice(0, HISTORY);
+    let t = TOASTS.get(key);
+    if (!t) {
+      let box = $('#kb-toasts');
+      if (!box) {
+        box = document.createElement('section');
+        box.id = 'kb-toasts';
+        box.className = 'kb-toasts';
+        box.setAttribute('aria-label', 'Notifications');
+        document.body.append(box);
+      }
+      const el = document.createElement('div');
+      el.className = 'kb-toast';
+      el.dataset.toast = key;
+      el.addEventListener('mouseenter', () => clearTimeout(TOASTS.get(key)?.timer));
+      el.addEventListener('mouseleave', () => armToast(key));
+      t = { el };
+      TOASTS.set(key, t);
+      box.append(el);
+    }
+    // Below the top bar, which wraps to two rows on a narrow window.
+    const bar = $('.kb-topbar')?.getBoundingClientRect().bottom;
+    if (bar) $('#kb-toasts').style.setProperty('--kb-toasts-top', `${Math.round(bar) + 8}px`);
+    t.sticky = sticky;
+    t.el.dataset.tone = tone;
+    t.el.setAttribute('role', tone === 'error' ? 'alert' : 'status');
+    const heading = document.createElement('strong');
+    heading.className = 'kb-toast-title';
+    heading.textContent = title;
+    const close = document.createElement('button');
+    close.type = 'button'; close.className = 'btn kb-toast-close'; close.dataset.variant = 'ghost'; close.dataset.size = 'icon-sm';
+    close.dataset.action = 'dismiss-toast'; close.dataset.toast = key; close.setAttribute('aria-label', 'Dismiss'); close.textContent = '×';
+    const parts = [heading, close];
+    if (text) {
+      const body = document.createElement('p');
+      body.className = 'kb-toast-text';
+      body.textContent = text;
+      parts.push(body);
+    }
+    if (action) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'btn'; button.dataset.size = 'sm'; button.dataset.variant = 'outline';
+      button.dataset.action = action.action; button.textContent = action.label;
+      if (action.id) button.dataset.change = action.id;
+      parts.push(button);
+    }
+    t.el.replaceChildren(...parts);
+    armToast(key);
+  }
+
+  function armToast(key) {
+    const t = TOASTS.get(key);
+    if (!t) return;
+    clearTimeout(t.timer);
+    if (!t.sticky) t.timer = setTimeout(() => dismissToast(key), TOAST_MS);
+  }
+
+  function dismissToast(key) {
+    const t = TOASTS.get(key);
+    if (!t) return;
+    clearTimeout(t.timer);
+    t.el.remove();
+    TOASTS.delete(key);
+  }
+
+  // A problem's toast, while it lasts.
+  function problem(key, message, action = null) {
+    if (message) notify(key, { title: action ? 'Not delivered' : 'Attention', text: message, tone: 'error', sticky: true, action });
+    else { SHOWN.delete(key); dismissToast(key); }
+  }
+
+  function syncToasts() {
+    const rows = new Map(changeStatuses().map((row) => [row.id, row]));
+    // What already waited when the page opened is in the bell's list, not a burst of toasts.
+    const opening = !syncToasts.primed && Boolean(S.data);
+    if (S.data) syncToasts.primed = true;
+    for (const [id, row] of rows) {
+      if (!id) continue;
+      TRACKED.set(id, row.summary);
+      const stuck = row.status === 'Needs resolution';
+      const action = LIVE ? { label: 'Cancel', action: 'cancel-change', id } : null;
+      if (opening && !stuck) { SHOWN.set(`change:${id}`, JSON.stringify([row.status, row.summary, 'info', action])); continue; }
+      notify(`change:${id}`, { title: row.status, text: row.summary, tone: stuck ? 'error' : 'info', sticky: stuck, action });
+    }
+    const applied = new Set(S.data?.applied || []);
+    const cancelled = new Set(S.data?.cancelled || []);
+    for (const [id, summary] of TRACKED) {
+      if (rows.has(id)) continue;
+      TRACKED.delete(id);
+      if (applied.has(id)) notify(`change:${id}`, { title: 'Applied', text: summary, tone: 'done' });
+      else if (cancelled.has(id)) notify(`change:${id}`, { title: 'Cancelled', text: summary, tone: 'muted' });
+      else dismissToast(`change:${id}`);
+    }
+    problem('problem:connection', S.connectionError);
+    problem('problem:delivery', S.deliveryError, { label: 'Retry delivery', action: 'retry-delivery' });
+    problem('problem:replay', S.replayError);
+    problem('problem:storage', S.storageError);
+    problem('problem:cancel', S.cancelError);
   }
 
   function showDeliveryError() {
@@ -1019,6 +1458,23 @@
     showModal(Mustache.render(T.cardModal, cardView(card, editing), T.partials));
     if (editing) restoreDraft();
     if (!editing && LIVE) bindTaskSortables($('#modal-body'), card.id);
+  }
+
+  // A level's document (an initiative or an epic): read-only here; the agent writes them.
+  function openDoc(path) {
+    persistDraft();
+    const text = S.files[path];
+    if (text === undefined) return;
+    const { meta, body } = parseCard(text);
+    const level = S.board.config.levels.find((l) => path.startsWith(`${l.id}/`));
+    const hidden = new Set(['id', 'title']);
+    S.modal = { kind: 'doc', path };
+    showModal(Mustache.render(T.docModal, {
+      id: String(meta.id ?? ''), title: String(meta.title ?? path), levelTitle: level?.title || '', path: `.ai/kanban/${path}`,
+      status: isEmpty(meta.status) ? '' : String(meta.status), statusColor: `var(--kb-${STATUS_COLORS[meta.status] || 'gray'})`,
+      fields: Object.entries(meta).filter(([k, v]) => !hidden.has(k) && k !== 'status' && !isEmpty(v)).map(([k, v]) => ({ label: k, text: (Array.isArray(v) ? v : [v]).join(', ') })),
+      bodyHtml: markdown(body, false),
+    }, T.partials));
   }
 
   function openNew(column) {
@@ -1134,6 +1590,7 @@
 
   function refreshModal() {
     if (S.modal?.kind === 'settings') { refreshSettings(); return; }
+    if (S.modal?.kind === 'doc') { if ($('#modal').open && S.files[S.modal.path] !== undefined) openDoc(S.modal.path); return; }
     if (S.modal?.schema && !sameValue(S.modal.schema, S.board.config)) showSchemaNotice();
     if (!S.modal || S.modal.kind !== 'card' || !$('#modal').open) return;
     const card = S.board.cards.get(S.modal.id);
@@ -1199,6 +1656,8 @@
         help: f.help,
         tile: Boolean(f.tile),
         marker: Boolean(f.marker),
+        scope: Boolean(f.scope),
+        isSelect: f.kind === 'select',
         existing: f.existing,
         kinds: KINDS.map((k) => ({ k, selected: k === (f.kind || 'text') })),
         hasOptions: ['select', 'multiselect'].includes(f.kind),
@@ -1302,6 +1761,7 @@
           : [],
       })),
       template: d.template,
+      levels: S.board.config.levels,
     };
     const migrations = reviewMigrations(board);
     if (migrations === null) return;
@@ -1613,6 +2073,10 @@
       $('#confirm').close();
       return;
     }
+    if (S.bellOpen && !e.target.closest('.kb-bell')) {
+      S.bellOpen = false;
+      render();
+    }
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const action = el.dataset.action;
@@ -1629,6 +2093,24 @@
       case 'retry-delivery':
         void sendPending();
         break;
+      case 'cancel-change':
+        void cancelChange(el.dataset.change);
+        break;
+      case 'confirm-cancel':
+        $('#confirm').close();
+        cancelNow(el.dataset.changes.split(' ')).catch(cancelFailed);
+        break;
+      case 'dismiss-toast':
+        dismissToast(el.dataset.toast);
+        break;
+      case 'bell':
+        S.bellOpen = !S.bellOpen;
+        render();
+        break;
+      case 'bell-clear':
+        S.history = [];
+        render();
+        break;
       case 'incoming-accept':
       case 'incoming-decline':
         resolveIncoming(el.dataset.field, action === 'incoming-accept');
@@ -1636,6 +2118,24 @@
       case 'open-card':
         openCard(el.dataset.id);
         break;
+      case 'open-doc':
+        openDoc(el.dataset.path);
+        break;
+      case 'toggle-node':
+        toggleNode(el.dataset.path, el.getAttribute('aria-expanded') !== 'true');
+        break;
+      case 'toggle-lane':
+        toggleLane(el.dataset.lane, el.getAttribute('aria-expanded') !== 'true');
+        break;
+      case 'view': {
+        S.view = el.dataset.view === 'outline' ? 'outline' : 'board';
+        const url = new URL(location.href);
+        if (S.view === 'outline') url.searchParams.set('view', 'outline');
+        else url.searchParams.delete('view');
+        history.replaceState(history.state, '', url);
+        render();
+        break;
+      }
       case 'edit-card':
         openCard(el.dataset.id, true);
         break;
@@ -1676,7 +2176,14 @@
     }
   });
 
+  window.addEventListener('resize', updateHeaderCounts);
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && S.bellOpen) {
+      S.bellOpen = false;
+      render();
+      $('[data-action="bell"]')?.focus();
+      return;
+    }
     if (e.key === 'Enter' && e.target.matches?.('.kb-tile')) openCard(e.target.dataset.id);
   });
 
@@ -1693,6 +2200,14 @@
     return true;
   }
   document.addEventListener('change', bindSetting);
+  document.addEventListener('change', (e) => {
+    if (e.target.dataset?.action !== 'scope') return;
+    S.scope = e.target.value;
+    const url = new URL(location.href);
+    url.searchParams.set('scope', S.scope);
+    history.replaceState(history.state, '', url);
+    render();
+  });
   for (const name of ['input', 'change']) document.addEventListener(name, event => {
     if (event.target.closest('#modal') && (S.modal?.editing || S.modal?.kind === 'new')) {
       S.modal.dirty = true; persistDraft();
@@ -1747,5 +2262,5 @@
   setInterval(poll, POLL_MS);
 
   // For tests and for poking at the board from the console.
-  window.kanban = { mergeMarkdown, rich: (textarea) => RICH.get(textarea)?.editor, state: S, buildBoard, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, poll, sendPending, LIVE };
+  window.kanban = { mergeMarkdown, rich: (textarea) => RICH.get(textarea)?.editor, state: S, buildBoard, render, inScope, scopeValue, markdown, dropIndex, openDoc, toggleLane, toggleNode, parseCard, serializeCard, serializeBoard, normalizeConfig, tasks, toggleTask, moveTask, applyChange, openCard, openNew, openSettings, commit, accept, poll, sendPending, cancelChange, updateHeaderCounts, toasts: TOASTS, TOAST_MS, LIVE };
 })();

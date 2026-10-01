@@ -1,14 +1,14 @@
 /*
  * The board settings editor: board.yml, visually. General (name, ticket key), Columns (their
- * order, titles and folders), Fields (their order, kind, tile and marker, and a select's
- * options with a label and a colour from the theme's palette) and the new-card Template.
+ * order, titles and folders), Fields (their order, kind, tile, marker and scope, and a
+ * select's options with a label and a colour from the theme's palette) and the new-card Template.
  * Mustache, filled in by app.js (`settingsView` there). Inputs carry `data-bind`, the path of
  * what they change in the draft; buttons carry `data-action="settings-…"`.
  */
 
 // Data: tabs { general, columns, fields, template }, tabList[] { id, title, selected },
 // errors[], name, key, columns[] { i, id, title, existing, count, removable }, fields[] { i,
-// name, label, help, tile, marker, existing, kinds[] { k, selected }, hasOptions, options[] {
+// name, label, help, tile, marker, scope, isSelect, existing, kinds[] { k, selected }, hasOptions, options[] {
 // i, j, value, label, color, css, paletteOpen, palette[] { i, j, name, css, selected } } },
 // body (the template), bind.
 KanbanTemplates.settings = /*html*/ `
@@ -86,6 +86,7 @@ KanbanTemplates.settings = /*html*/ `
         <div class="kb-settings-flags">
           <label class="label"><input type="checkbox" data-bind="fields.{{i}}.tile" {{#tile}}checked{{/tile}}> On tiles</label>
           <label class="label"><input type="checkbox" data-bind="fields.{{i}}.marker" {{#marker}}checked{{/marker}}> Tile border colour</label>
+          {{#isSelect}}<label class="label" title="The page shows one of its values at a time; the option marked current: true by default"><input type="checkbox" data-bind="fields.{{i}}.scope" {{#scope}}checked{{/scope}}> Board scope</label>{{/isSelect}}
           <input class="input kb-settings-help" type="text" value="{{help}}" data-bind="fields.{{i}}.help" placeholder="Help, under its input" aria-label="Help">
         </div>
         {{#hasOptions}}

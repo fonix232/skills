@@ -146,6 +146,167 @@
   filter.value = '';
   filter.dispatchEvent(new Event('input', { bubbles: true }));
 
+  // ---- the board scope: one milestone at a time
+  const scoped = k.buildBoard({ ...files, 'board.yml': files['board.yml'].replace('fields:\n', 'fields:\n  - name: milestone\n    label: Milestone\n    kind: select\n    scope: true\n    options:\n      - M1\n      - { value: M2, label: Second, current: true }\n') });
+  scoped.cards.get(1).meta.milestone = 'M1';
+  scoped.cards.get(2).meta.milestone = 'M2';
+  scoped.cards.get(3).meta.milestone = 'M2';
+  const unscoped = k.state.board;
+  k.state.board = scoped;
+  k.state.scope = null;
+  k.render();
+  const visible = () => [...document.querySelectorAll('.kb-tile:not(.kb-hidden)')].map((t) => Number(t.dataset.id)).sort();
+  const counts = () => [...document.querySelectorAll('.kb-column-header .badge')].map((b) => Number(b.textContent));
+  const picker = () => document.querySelector('[data-action="scope"]');
+  eq('the current milestone shows by default', visible(), [2, 3]);
+  eq('column counts are the cards in scope', counts(), [1, 1, 0]);
+  eq('the picker lists every milestone, the current one marked', [...picker().options].map((o) => o.textContent), ['Every milestone', 'M1', 'Second (current)', 'No milestone']);
+  eq('and selects the current one', picker().value, 'M2');
+  picker().value = 'M1';
+  picker().dispatchEvent(new Event('change', { bubbles: true }));
+  eq('picking another milestone shows its cards', visible(), [1]);
+  eq('and keeps it in the address', new URLSearchParams(location.search).get('scope'), 'M1');
+  picker().value = '-';
+  picker().dispatchEvent(new Event('change', { bubbles: true }));
+  eq('"No milestone" shows the unassigned cards', visible(), [4]);
+  k.state.lanes = {}; // not what an earlier run left in this browser
+  picker().value = '*';
+  picker().dispatchEvent(new Event('change', { bubbles: true }));
+  const laneNames = () => [...document.querySelectorAll('.kb-lane-header')].map((h) => h.textContent.replace(/\s+/g, ' ').trim());
+  eq('"Every milestone" lists a lane per milestone, and one for cards without', laneNames(), ['M1 1 card', 'Second Current 2 cards', 'No milestone 1 card']);
+  eq('only the current milestone\'s lane starts open', visible(), [2, 3]);
+  const laneButton = (v) => document.querySelector(`.kb-lane-header[data-lane="${v}"]`);
+  eq('a folded lane says so', laneButton('M1').getAttribute('aria-expanded'), 'false');
+  laneButton('M1').click();
+  eq('opening a lane shows its cards', visible(), [1, 2, 3]);
+  laneButton('-').click();
+  eq('every lane open shows every card', visible(), [1, 2, 3, 4]);
+  laneButton('M2').click();
+  eq('folding the current lane hides its cards', visible(), [1, 4]);
+  check('the choice is remembered', k.state.lanes.M2 === true && k.state.lanes.M1 === false);
+  const cellsOf = (col) => [...document.querySelectorAll(`.kb-cards[data-column="${col}"]`)].map((l) => l.dataset.lane);
+  eq('each open lane has its own list per column', cellsOf('todo'), ['M1', '-']);
+  eq('the column headers show once, above the lanes', document.querySelectorAll('.kb-column').length, 3);
+  // The headers count the lane under them.
+  k.state.lanes = { M1: false, M2: false, '-': false };
+  const short = document.createElement('style');
+  short.textContent = '.kb-app { height: 300px !important; } .kb-lane-body { min-height: 400px !important; }';
+  document.head.append(short);
+  k.render();
+  const headCount = (col) => document.querySelector(`.kb-column[data-column="${col}"] .kb-column-count`);
+  const scrollToLane = (v) => {
+    const b = document.querySelector('.kb-board');
+    const lane = document.querySelector(`.kb-lane[data-lane="${v}"]`);
+    b.scrollTop += lane.getBoundingClientRect().top - document.querySelector('.kb-board-head').getBoundingClientRect().bottom + 10;
+    k.updateHeaderCounts();
+  };
+  k.updateHeaderCounts();
+  eq('above the lanes, the headers count the whole column', ['todo', 'doing'].map((c) => headCount(c).textContent), ['3', '1']);
+  scrollToLane('M2');
+  eq('in a lane, they count its cards out of the column\'s', ['todo', 'doing', 'done'].map((c) => headCount(c).textContent), ['1/3', '1/1', '0/0']);
+  has('and say which lane', headCount('doing').title, 'Second');
+  scrollToLane('-');
+  eq('the next lane down counts its own', headCount('doing').textContent, '0/1');
+  k.state.lanes = { M1: false, M2: true, '-': false };
+  k.render();
+  scrollToLane('M2');
+  eq('a folded lane counts too', headCount('doing').textContent, '1/1');
+  document.querySelector('.kb-board').scrollTop = 0;
+  k.updateHeaderCounts();
+  eq('back at the top, the totals return', headCount('todo').textContent, '3');
+  check('without a title', !headCount('todo').hasAttribute('title'));
+  short.remove();
+  k.state.lanes = {};
+  // Dropping into a lane's list: the place in the column's whole order.
+  eq('dropped above a card: just before it', k.dropIndex('todo', 4, 1, null), 1);
+  eq('dropped below a card: just after it', k.dropIndex('todo', 4, null, 2), 1);
+  eq('dropped into an empty list: last in the column', k.dropIndex('done', 1, null, null), 0);
+  eq('moved within its own column, it counts the others', k.dropIndex('todo', 2, null, 4), 2);
+  k.state.scope = 'M2';
+  k.render();
+  const scopedFilter = document.querySelector('[data-action="filter"]');
+  scopedFilter.value = 'first';
+  scopedFilter.dispatchEvent(new Event('input', { bubbles: true }));
+  eq('the text filter works within the scope', visible(), []);
+  scopedFilter.value = '';
+  scopedFilter.dispatchEvent(new Event('input', { bubbles: true }));
+  k.openNew('todo');
+  eq('a new card starts in the milestone shown', document.querySelector('#modal [name="milestone"]')?.value, 'M2');
+  document.getElementById('modal').close();
+  k.state.scope = null;
+  history.replaceState(history.state, '', location.pathname + location.hash);
+  k.state.board = unscoped;
+  k.render();
+  eq('a board without a scope field has no picker', [picker(), visible()], [null, [1, 2, 3, 4]]);
+
+  // ---- the outline: initiatives, their epics, each epic's cards
+  const leveled = k.buildBoard({
+    ...files,
+    'board.yml': files['board.yml'].replace('fields:\n', 'fields:\n  - name: milestone\n    label: Milestone\n    kind: select\n    scope: true\n    options:\n      - M1\n      - { value: M2, label: Second, current: true }\n  - name: epic\n    label: Epic\n    kind: select\n') + 'levels:\n  - { id: initiatives, title: Initiatives }\n  - { id: epics, title: Epics, parent: initiative, field: epic }\n',
+  });
+  eq('levels come from board.yml', leveled.config.levels.map((l) => [l.id, l.parent || null, l.field || null]), [['initiatives', null, null], ['epics', 'initiative', 'epic']]);
+  has('the settings write levels back', k.serializeBoard(leveled.config), 'levels:\n  - {id: initiatives, title: Initiatives}\n  - {id: epics, title: Epics, parent: initiative, field: epic}');
+  eq('and read them again the same', k.normalizeConfig(jsyaml.load(k.serializeBoard(leveled.config))).levels, leveled.config.levels);
+  leveled.cards.get(1).meta = { ...leveled.cards.get(1).meta, milestone: 'M1', epic: 'E1.2' };
+  leveled.cards.get(2).meta = { ...leveled.cards.get(2).meta, milestone: 'M2', epic: 'E1.1' };
+  leveled.cards.get(3).meta = { ...leveled.cards.get(3).meta, milestone: 'M2', epic: 'E1.1' };
+  const docs = {
+    'initiatives/I1-draw-the-home.md': '---\nid: I1\ntitle: Draw the home\nstatus: in-progress\nmilestones: [M1, M2]\n---\n\nThe outcome.\n',
+    'epics/E1.1-zones.md': '---\nid: E1.1\ntitle: Zones\nstatus: approved\ninitiative: I1\nmilestone: M2\n---\n\nZones on the plan.\n',
+    'epics/E1.2-walls.md': '---\nid: E1.2\ntitle: Walls\nstatus: draft\ninitiative: I1\nmilestone: M1\n---\n\nWalls.\n',
+    'epics/E9.1-orphan.md': '---\nid: E9.1\ntitle: Orphan\ninitiative: I9\nmilestone: M2\n---\n',
+  };
+  const savedFiles = k.state.files;
+  k.state.files = { ...savedFiles, ...docs };
+  k.state.board = leveled;
+  k.state.scope = 'M2';
+  k.state.view = 'outline';
+  k.render();
+  const nodes = () => [...document.querySelectorAll('.kb-node[data-doc]')].map((n) => n.dataset.doc);
+  eq('the outline view replaces the columns', [Boolean(document.querySelector('.kb-outline')), Boolean(document.querySelector('.kb-board'))], [true, false]);
+  eq('in a milestone, it shows the documents in it, under their parents', nodes(), ['I1', 'E1.1', 'E9.1']);
+  has('an epic lists its cards', document.querySelector('.kb-node[data-doc="E1.1"]').textContent, 'DEMO-2');
+  has('a document shows its status', document.querySelector('.kb-node[data-doc="E1.1"] .kb-pill').textContent, 'approved');
+  eq('progress counts the cards done', document.querySelector('.kb-node[data-doc="E1.1"] .kb-progress').getAttribute('aria-valuenow'), '0');
+  k.state.scope = '*';
+  k.render();
+  eq('with every milestone, every document', nodes(), ['I1', 'E1.1', 'E1.2', 'E9.1']);
+  has('cards in no epic are listed apart', document.querySelector('.kb-node-loose')?.textContent || '', 'DEMO-4');
+  has('the view switch names the levels', document.querySelector('[data-action="view"][data-view="outline"]').textContent, 'Initiatives & Epics');
+  k.state.folded = {}; // not what an earlier run left in this browser
+  k.render();
+  const fold = (doc) => document.querySelector(`.kb-node[data-doc="${doc}"] > .kb-node-row [data-action="toggle-node"]`);
+  eq('a document with something under it starts open', fold('I1')?.getAttribute('aria-expanded'), 'true');
+  check('one with nothing under it has no fold button', !fold('E9.1'));
+  fold('I1').click();
+  eq('folding an initiative hides its epics', nodes(), ['I1', 'E9.1']);
+  eq('and says so', fold('I1').getAttribute('aria-expanded'), 'false');
+  has('it keeps its progress', document.querySelector('.kb-node[data-doc="I1"] .kb-node-progress')?.getAttribute('title') || '', 'cards done');
+  k.render();
+  eq('a fold survives a redraw', nodes(), ['I1', 'E9.1']);
+  eq('and is saved for the board', JSON.parse(localStorage.getItem(`kanban-outline:${k.state.data?.boardId || location.pathname}`) || '{}')['initiatives/I1-draw-the-home.md'], true);
+  fold('I1').click();
+  fold('E1.1').click();
+  check('folding an epic hides its cards', !document.querySelector('.kb-node[data-doc="E1.1"] .kb-node-stories'));
+  fold('E1.1').click();
+  eq('unfolding shows everything again', nodes(), ['I1', 'E1.1', 'E1.2', 'E9.1']);
+  k.openDoc('epics/E1.1-zones.md');
+  has('a document opens read-only', document.getElementById('modal-title').textContent, 'Zones');
+  has('with its body', document.querySelector('#modal .kb-markdown').textContent, 'Zones on the plan.');
+  has('and its front matter', document.querySelector('#modal .kb-fields').textContent, 'initiative');
+  document.getElementById('modal').close();
+  k.state.view = 'board';
+  k.state.scope = null;
+  k.state.files = savedFiles;
+  k.state.board = unscoped;
+  k.render();
+  check('a board without levels has no view switch', !document.querySelector('[data-action="view"]'));
+
+  // ---- a card's images, from the board's attachments folder
+  const pic = k.markdown('![Plan](../attachments/DEMO-1/plan.png) ![Elsewhere](https://example.invalid/x.png)');
+  has('a card image points at the served attachments folder', pic, 'src="attachments/DEMO-1/plan.png"');
+  has('other images are left alone', pic, 'src="https://example.invalid/x.png"');
+
   // ---- the card modal
   k.openCard(1);
   const modal = document.getElementById('modal');
@@ -503,15 +664,152 @@
     k.accept(data);
     const appendPoll = document.head.append;
     document.head.append = script => script.onerror(); k.poll(); document.head.append = appendPoll;
-    has('failed polling announces stale board data', document.querySelector('.kb-app').textContent, 'Connection lost');
+    has('failed polling announces stale board data', document.querySelector('#kb-toasts').textContent, 'Connection lost');
     window.KANBAN_DATA = { ...data, queue: [{ id: 'remote-pending', summary: 'Remote edit', status: 'Needs resolution', reason: 'Choose the intended title' }] };
     document.head.append = script => script.onload(); k.poll(); document.head.append = appendPoll;
     check('successful polling clears the connection warning', !k.state.connectionError);
-    has('status-only polling shows resolution details', document.querySelector('.kb-change-status').textContent, 'Needs resolution');
-    has('resolution reason is visible', document.querySelector('.kb-change-status').textContent, 'Choose the intended title');
+    check('a restored connection clears its toast', !document.querySelector('[data-toast="problem:connection"]'));
+    has('status-only polling shows resolution details', document.querySelector('#kb-toasts').textContent, 'Needs resolution');
+    has('resolution reason is visible', document.querySelector('#kb-toasts').textContent, 'Choose the intended title');
+    check('a change needing resolution stays until it is resolved', k.toasts.get('change:remote-pending')?.sticky === true);
     k.accept(data); window.KANBAN_DATA = data;
 
+    // Cancelling a change waiting for the agent restores the board and withdraws it.
+    {
+      const cancels = [];
+      let plan = null;
+      let oldServer = false;
+      window.fetch = async (url, opts) => {
+        const payload = JSON.parse(opts.body);
+        if (String(url).endsWith('/api/cancel')) {
+          cancels.push(payload);
+          if (oldServer) return { ok: false, status: 404, json: async () => { throw new Error('html'); } };
+          const ids = plan ? plan.cancelled : payload.ids;
+          return { ok: true, json: async () => ({ cancelled: ids, summaries: plan?.summaries || {}, paths: plan?.paths || [] }) };
+        }
+        return { ok: true, json: async () => ({ queued: payload.id }) };
+      };
+      k.state.pending = [];
+      k.accept(data);
+      const column = () => k.state.board.cards.get(2).column;
+      const was = column();
+      k.commit('move', { card: 2, column: 'done', index: 0 }, 'Move DEMO-2 to Done');
+      await settled();
+      eq('a move shows at once', column(), 'done');
+      const moveId = k.state.pending[0].id;
+      document.querySelector('[data-action="bell"]').click();
+      const cancelButton = document.querySelector(`#kb-bell-panel [data-action="cancel-change"][data-change="${moveId}"]`);
+      check('a waiting change has a Cancel button in the bell', Boolean(cancelButton));
+      check('and on its toast', Boolean(document.querySelector(`[data-toast="change:${moveId}"] [data-action="cancel-change"]`)));
+      cancelButton.click();
+      await settled();
+      eq('cancelling asks the server what goes, then cancels it', cancels.map((c) => [c.ids, Boolean(c.dry_run)]), [[[moveId], true], [[moveId], false]]);
+      eq('the board is restored', column(), was);
+      eq('the change leaves the outbox', k.state.pending.length, 0);
+      has('its toast says it was cancelled', document.querySelector(`[data-toast="change:${moveId}"]`)?.textContent, 'Cancelled');
+
+      cancels.length = 0;
+      plan = { cancelled: ['q2', 'q3'], summaries: { q2: 'Move DEMO-1 to Done', q3: 'Edit DEMO-1' }, paths: ['done/_done.md'] };
+      k.accept({ ...data, version: 'cancel-queue', queue: [
+        { id: 'q2', summary: 'Move DEMO-1 to Done', status: 'Queued for agent' },
+        { id: 'q3', summary: 'Edit DEMO-1', status: 'Queued for agent' },
+        { id: 'q4', summary: 'Move DEMO-4 to Doing', status: 'Queued for agent' }] });
+      await k.cancelChange('q2');
+      const dialog = document.getElementById('confirm');
+      check('changes built on it need a confirmation', dialog.open && cancels.length === 1);
+      has('which names them', dialog.textContent, 'Edit DEMO-1');
+      has('and what it was built on', dialog.textContent, 'Move DEMO-1 to Done');
+      dialog.querySelector('[data-action="confirm-cancel"]').click();
+      await settled();
+      eq('confirming cancels them together', cancels[1]?.ids, ['q2', 'q3']);
+      eq('and only those leave the queue', k.state.data.queue.map((row) => row.id), ['q4']);
+
+      cancels.length = 0;
+      plan = null;
+      oldServer = true;
+      await k.cancelChange('q4');
+      has('an old server says to restart it', document.querySelector('[data-toast="problem:cancel"]')?.textContent, 'Restart serve.py');
+      oldServer = false;
+      await k.cancelChange('q4');
+      check('and the problem clears once cancelling works', !document.querySelector('[data-toast="problem:cancel"]'));
+      k.state.bellOpen = false;
+      k.state.pending = [];
+      k.accept(data); window.KANBAN_DATA = data;
+    }
+
     window.fetch = realFetch;
+  }
+
+  // ---- polling keeps the reader's place
+  {
+    k.accept(data); window.KANBAN_DATA = data;
+    const tall = document.createElement('style');
+    tall.textContent = '.kb-app { height: 200px !important; } .kb-lane { min-height: 2000px !important; }';
+    document.head.append(tall);
+    k.render();
+    const boardEl = () => document.querySelector('.kb-board');
+    boardEl().scrollTop = 300;
+    const before = boardEl();
+    const appendPoll = document.head.append;
+    document.head.append = (script) => script.onload(); k.poll(); document.head.append = appendPoll;
+    check('an unchanged poll leaves the board as it is', boardEl() === before);
+    eq('an unchanged poll keeps the board\'s scroll', boardEl().scrollTop, 300);
+    window.KANBAN_DATA = { ...data, version: 'scroll-kept' };
+    document.head.append = (script) => script.onload(); k.poll(); document.head.append = appendPoll;
+    check('a changed poll draws the board again', boardEl() !== before);
+    eq('a redraw keeps the board\'s vertical scroll', boardEl().scrollTop, 300);
+    k.state.dragging = true;
+    const dragged = boardEl();
+    k.render();
+    check('no redraw while a card is dragged', boardEl() === dragged && k.state.redraw);
+    k.state.dragging = false; k.state.redraw = false;
+    tall.remove();
+    k.accept(data); window.KANBAN_DATA = data;
+  }
+
+  // ---- toasts and the notifications bell
+  {
+    window.KANBAN_DATA = { ...data, version: 'toasts', queue: [{ id: 'toast-1', summary: 'Move MAQ-1 to Done', status: 'Queued for agent' }] };
+    k.accept(window.KANBAN_DATA);
+    const toastEl = () => document.querySelector('[data-toast="change:toast-1"]');
+    has('a queued change shows a toast', toastEl()?.textContent, 'Queued for agent');
+    has('the toast names the change', toastEl()?.textContent, 'Move MAQ-1 to Done');
+    check('the toasts sit outside the board, so redraws leave them', !document.querySelector('#app #kb-toasts'));
+    check('a change\'s toast dismisses itself', k.toasts.get('change:toast-1')?.sticky === false && k.TOAST_MS >= 15000 && k.TOAST_MS <= 20000);
+    has('the bell counts the waiting changes', document.querySelector('[data-action="bell"]').textContent, '1 pending changes');
+    const first = toastEl();
+    k.render();
+    check('a redraw keeps the same toast', toastEl() === first);
+    window.KANBAN_DATA = { ...data, version: 'toasts-applied', queue: [], applied: [...(data.applied || []), 'toast-1'] };
+    k.accept(window.KANBAN_DATA);
+    check('an applied change updates its toast in place', toastEl() === first);
+    has('and says it was applied', toastEl()?.textContent, 'Applied');
+    toastEl().querySelector('[data-action="dismiss-toast"]').click();
+    check('the close button dismisses a toast', !toastEl());
+    k.render();
+    check('a dismissed toast doesn\'t come back on a redraw', !toastEl());
+    document.querySelector('[data-action="bell"]').click();
+    const panel = () => document.querySelector('#kb-bell-panel');
+    check('the bell opens the drop-down', Boolean(panel()));
+    has('it lists recent notifications', panel()?.textContent, 'Move MAQ-1 to Done');
+    has('and what waits for the agent', panel()?.textContent, 'Nothing waiting');
+    k.render();
+    check('the drop-down stays open across a redraw', Boolean(panel()));
+    panel().querySelector('[data-action="bell-clear"]').click();
+    has('Clear empties the recent list', panel()?.textContent, 'No notifications yet');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    check('Escape closes the drop-down', !panel());
+    document.querySelector('[data-action="bell"]').click();
+    document.querySelector('.kb-board, .kb-outline').click();
+    check('a click outside closes the drop-down', !panel());
+    k.state.deliveryError = 'Changes could not be delivered: test.';
+    k.render();
+    const delivery = document.querySelector('[data-toast="problem:delivery"]');
+    check('a delivery problem stays as a toast with its retry', k.toasts.get('problem:delivery')?.sticky === true && Boolean(delivery?.querySelector('[data-action="retry-delivery"]')));
+    k.state.deliveryError = '';
+    k.render();
+    check('and goes when the problem clears', !document.querySelector('[data-toast="problem:delivery"]'));
+    k.accept(data); window.KANBAN_DATA = data;
   }
 
   document.getElementById('results').textContent = lines.join('\n');

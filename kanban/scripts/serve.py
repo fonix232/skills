@@ -11,9 +11,11 @@ import subprocess
 import threading
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 MAX_BODY = 8 * 1024 * 1024
+# A card's images, served from the board's attachments/ folder; nothing else is.
+IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif'}
 
 
 def board_files(board):
@@ -65,16 +67,21 @@ class Inbox:
         self.board = board.resolve()
         self.db = view / 'inbox.sqlite3'
         self.lock = threading.Lock()
-        with self.connect() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS changes (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
-                    payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS reservations (id TEXT PRIMARY KEY, card INTEGER UNIQUE NOT NULL);
-            ''')
+        # Other processes (a second server, an agent's script) may open the same inbox at the
+        # same moment: create and migrate the schema inside one exclusive transaction, so the
+        # second caller waits and then finds it done. (executescript would commit first.)
+        with self.lock, self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('''CREATE TABLE IF NOT EXISTS changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+                payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0)''')
+            db.execute('CREATE TABLE IF NOT EXISTS reservations (id TEXT PRIMARY KEY, card INTEGER UNIQUE NOT NULL)')
             columns = {row[1] for row in db.execute('PRAGMA table_info(changes)')}
             if 'reason' not in columns:
                 db.execute("ALTER TABLE changes ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+            # A cancelled change stays as a tombstone: a late retry of it can't queue it again.
+            if 'cancelled' not in columns:
+                db.execute('ALTER TABLE changes ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def connect(self):
@@ -90,15 +97,22 @@ class Inbox:
         files, stats = board_files(self.board)
         with self.connect() as db:
             applied = [row[0] for row in db.execute('SELECT id FROM changes WHERE applied = 1 ORDER BY seq')]
+            cancelled = [row[0] for row in db.execute('SELECT id FROM changes WHERE cancelled = 1 ORDER BY seq')]
             queue = [{'id': row[0], 'summary': json.loads(row[1]).get('summary', 'Board change'),
                       'status': 'Needs resolution' if row[2] else 'Queued for agent', 'reason': row[2]}
-                     for row in db.execute('SELECT id, payload, reason FROM changes WHERE applied = 0 ORDER BY seq')]
+                     for row in db.execute('SELECT id, payload, reason FROM changes WHERE applied = 0 AND cancelled = 0 ORDER BY seq')]
         return {'queue': queue, 'version': version_of(files), 'boardId': hashlib.sha256(str(self.board).encode()).hexdigest()[:16],
-                'files': files, 'stats': stats, 'applied': applied}
+                'files': files, 'stats': stats, 'applied': applied, 'cancelled': cancelled}
 
     def pending(self):
+        """The changes waiting for the agent. A cancelled prerequisite is no longer required."""
         with self.connect() as db:
-            return [json.loads(row[0]) for row in db.execute('SELECT payload FROM changes WHERE applied = 0 ORDER BY seq')]
+            cancelled = {row[0] for row in db.execute('SELECT id FROM changes WHERE cancelled = 1')}
+            events = [json.loads(row[0]) for row in db.execute('SELECT payload FROM changes WHERE applied = 0 AND cancelled = 0 ORDER BY seq')]
+        for event in events:
+            if 'requires' in event:
+                event['requires'] = [i for i in event['requires'] if i not in cancelled]
+        return events
 
     def reserve(self, request_id):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', request_id):
@@ -145,8 +159,10 @@ class Inbox:
         payload = json.dumps(event, sort_keys=True)
         with self.lock, self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            existing = db.execute('SELECT payload FROM changes WHERE id = ?', (event['id'],)).fetchone()
+            existing = db.execute('SELECT payload, cancelled FROM changes WHERE id = ?', (event['id'],)).fetchone()
             if existing:
+                if existing[1]:
+                    return  # cancelled before this retry arrived: it stays cancelled
                 if existing[0] != payload:
                     raise ValueError('A different change already uses this id')
                 return
@@ -161,16 +177,18 @@ class Inbox:
 
     def check(self, event_id):
         with self.connect() as db:
-            row = db.execute('SELECT payload FROM changes WHERE id = ?', (event_id,)).fetchone()
+            row = db.execute('SELECT payload, cancelled FROM changes WHERE id = ?', (event_id,)).fetchone()
             if not row:
                 raise ValueError('Unknown change id')
+            if row[1]:
+                return {'cancelled': True}
             event = json.loads(row[0])
-            applied = {r[0] for r in db.execute('SELECT id FROM changes WHERE applied = 1')}
+            done = {r[0] for r in db.execute('SELECT id FROM changes WHERE applied = 1 OR cancelled = 1')}
         files, _ = board_files(self.board)
         changed = [path for path, old in event['before'].items() if files.get(path) != old]
-        blocked = [i for i in event.get('requires', []) if i not in applied]
+        blocked = [i for i in event.get('requires', []) if i not in done]
         written = all(files.get(p) == text for p, text in event['writes'].items()) and all(p not in files for p in event['deletes'])
-        return {'base_is_current': version_of(files) == event.get('base'),
+        return {'cancelled': False, 'base_is_current': version_of(files) == event.get('base'),
                 'paths_match': not changed and not blocked, 'changed_paths': changed,
                 'blocked_by': blocked, 'already_written': written and not blocked}
 
@@ -178,9 +196,9 @@ class Inbox:
         if not isinstance(reason, str) or len(reason) > 2000:
             raise ValueError('A resolution reason must be text of at most 2000 characters')
         with self.lock, self.connect() as db:
-            result = db.execute('UPDATE changes SET reason = ? WHERE id = ? AND applied = 0', (reason, event_id))
+            result = db.execute('UPDATE changes SET reason = ? WHERE id = ? AND applied = 0 AND cancelled = 0', (reason, event_id))
             if not result.rowcount:
-                raise ValueError('Unknown or already applied change')
+                raise ValueError('Unknown, cancelled or already applied change')
 
     def acknowledge(self, ids):
         if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
@@ -188,9 +206,43 @@ class Inbox:
         with self.lock, self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             for event_id in ids:
-                if not db.execute('SELECT 1 FROM changes WHERE id = ?', (event_id,)).fetchone():
+                row = db.execute('SELECT cancelled FROM changes WHERE id = ?', (event_id,)).fetchone()
+                if not row:
                     raise ValueError('Unknown change id')
+                if row[0]:
+                    raise ValueError(f'Change {event_id} was cancelled on the dashboard: restore its before snapshots instead')
                 db.execute('UPDATE changes SET applied = 1 WHERE id = ?', (event_id,))
+
+    def cancel(self, ids, dry_run=False):
+        """Withdraws pending changes, with every later pending change that touches a file one
+        of them touches: those changes' writes were built on top of it. Returns what goes, in
+        order, and the files involved; a dry run only reports it. An id the inbox hasn't seen
+        (a delivery still on its way) is kept as a cancelled tombstone, so it can't arrive later."""
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,100}', i) for i in ids):
+            raise ValueError('Expected a list of change ids')
+        with self.lock, self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = db.execute('SELECT id, payload, applied, cancelled FROM changes ORDER BY seq').fetchall()
+            known = {row[0]: row for row in rows}
+            for event_id in ids:
+                if event_id in known and known[event_id][2]:
+                    raise ValueError(f'Change {event_id} was already applied; it can no longer be cancelled')
+            chosen, order, paths, summaries = set(ids), [], set(), {}
+            for event_id, payload, applied, cancelled in rows:
+                if applied or cancelled:
+                    continue
+                event = json.loads(payload)
+                touched = set(event['writes']) | set(event['deletes'])
+                if event_id in chosen or touched & paths:
+                    chosen.add(event_id)
+                    order.append(event_id)
+                    paths |= touched
+                    summaries[event_id] = event.get('summary', 'Board change')
+            unseen = [i for i in ids if i not in known]
+            if not dry_run:
+                db.executemany('UPDATE changes SET cancelled = 1 WHERE id = ?', [(i,) for i in order])
+                db.executemany("INSERT INTO changes (id, payload, cancelled) VALUES (?, 'null', 1)", [(i,) for i in unseen])
+        return {'cancelled': order + unseen, 'summaries': summaries, 'paths': sorted(paths)}
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -231,6 +283,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+            if path.startswith('/attachments/'):
+                return self.send_attachment(path)
             # Serve only dashboard assets, never the inbox, logs or repository files.
             if path == '/' or path in ('/index.html', '/app.js', '/app.css') or path.startswith(('/templates/', '/vendor/')):
                 if '..' not in path and '%' not in path:
@@ -238,6 +292,22 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(404)
         except (ValueError, OSError, sqlite3.Error) as exc:
             self.json_response(500, {'error': str(exc)})
+
+    def send_attachment(self, path):
+        """An image under the board's attachments/ folder; anything else is a 404."""
+        rel = PurePosixPath(unquote(path).lstrip('/'))
+        root = (self.server.board / 'attachments').resolve()
+        file = (self.server.board / rel).resolve()
+        if '..' in rel.parts or rel.suffix.lower() not in IMAGE_TYPES or not file.is_relative_to(root) or not file.is_file():
+            return self.send_error(404)
+        data = file.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Type', IMAGE_TYPES[rel.suffix.lower()])
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         origin = self.headers.get('Origin')
@@ -261,6 +331,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/change-status':
                 self.server.inbox.report(data['id'], data['reason'])
                 return self.json_response(200, {'id': data['id']})
+            if path == '/api/cancel':
+                return self.json_response(200, self.server.inbox.cancel(data['ids'], bool(data.get('dry_run'))))
             if path == '/api/applied':
                 self.server.inbox.acknowledge(data['ids'])
                 return self.json_response(200, {'applied': data['ids']})

@@ -122,3 +122,34 @@ KanbanTemplates.confirmDelete = /*html*/ `
   <button type="button" class="btn" data-variant="destructive" data-action="confirm-delete" data-id="{{id}}" disabled>Delete {{ticket}}</button>
 </footer>
 `;
+
+// A level's document (an initiative or an epic), read-only. Data: id, title, levelTitle, path,
+// status, statusColor, fields[] { label, text }, bodyHtml.
+KanbanTemplates.docModal = /*html*/ `
+<header class="kb-detail-header">
+  <div class="flex items-center gap-2 text-xs font-mono text-muted-foreground">
+    <span>{{levelTitle}}</span><span aria-hidden="true">·</span><span>{{id}}</span>
+    <span class="kb-info" tabindex="0" aria-label="File details">
+      {{> iconInfo}}
+      <span class="kb-info-pop" role="tooltip"><span class="kb-info-row"><span>File</span><code>{{path}}</code></span></span>
+    </span>
+  </div>
+  <h2 id="modal-title" class="text-xl font-semibold leading-snug">{{title}}</h2>
+</header>
+<section class="kb-modal-body">
+  <div class="kb-detail">
+    <article class="kb-markdown">{{{bodyHtml}}}</article>
+    <aside class="kb-side">
+      <dl class="kb-fields">
+        {{#status}}<div><dt>Status</dt><dd><span class="badge kb-pill" style="--kb-pill: {{statusColor}}">{{status}}</span></dd></div>{{/status}}
+        {{#fields}}<div><dt>{{label}}</dt><dd>{{text}}</dd></div>{{/fields}}
+      </dl>
+    </aside>
+  </div>
+</section>
+<footer>
+  <button type="button" class="btn" data-variant="outline" data-action="close" autofocus>Close</button>
+</footer>
+
+<button type="button" aria-label="Close" data-action="close">{{> iconClose}}</button>
+`;

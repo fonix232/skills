@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sqlite3
 import subprocess
 import threading
 import unittest
@@ -49,6 +50,21 @@ class InboxTests(unittest.TestCase):
         return {'id': event_id, 'op': 'save', 'card': 1, 'base': self.server.inbox.state()['version'],
                 'title': 'First', 'body': body, 'fields': {}, 'requires': [],
                 'before': {path: (self.board / path).read_text()}, 'writes': {path: body}, 'deletes': []}
+
+    def test_attachments_serve_images_and_nothing_else(self):
+        folder = self.board / 'attachments' / 'DEMO-1'
+        folder.mkdir(parents=True)
+        (folder / 'plan one.png').write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        (folder / 'notes.md').write_text('not an image')
+        with urlopen(self.url + '/attachments/DEMO-1/plan%20one.png', timeout=5) as response:
+            self.assertEqual(response.headers['Content-Type'], 'image/png')
+            self.assertEqual(response.read(), b'\x89PNG\r\n\x1a\nfake')
+        for path in ('/attachments/DEMO-1/notes.md', '/attachments/DEMO-1/../../board.yml', '/attachments/%2e%2e/board.yml',
+                     '/attachments/DEMO-1/missing.png', '/board.yml', '/todo/001-first.md'):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as caught:
+                urlopen(self.url + path, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+            caught.exception.close()
 
     def test_resolution_status_persists_and_acknowledgement_removes_it(self):
         self.request('/api/changes', self.change())
@@ -106,6 +122,38 @@ class InboxTests(unittest.TestCase):
         (self.board / 'todo/100-manual.md').write_text('---\nid: 100\ntitle: Manual\n---\n')
         self.assertEqual(reopened.reserve('next'), 101)
 
+    def first_use(self, view, callers=8):
+        """Open a fresh inbox from several callers at once; return their numbers and errors."""
+        gate = threading.Barrier(callers)
+        def call(n):
+            gate.wait()
+            return serve.Inbox(view, self.board).reserve(f'first-use-{n}')
+        with ThreadPoolExecutor(max_workers=callers) as pool:
+            futures = [pool.submit(call, n) for n in range(callers)]
+        errors = [repr(f.exception()) for f in futures if f.exception()]
+        return sorted(f.result() for f in futures if not f.exception()), errors
+
+    def test_concurrent_first_use_of_a_fresh_inbox(self):
+        for trial in range(20):
+            view = self.root / f'fresh-{trial}'
+            view.mkdir()
+            numbers, errors = self.first_use(view)
+            self.assertEqual(errors, [])
+            self.assertEqual(numbers, list(range(2, 10)))  # the board's card 1 is taken
+
+    def test_concurrent_first_use_migrates_an_old_inbox_once(self):
+        for trial in range(20):
+            view = self.root / f'old-{trial}'
+            view.mkdir()
+            with sqlite3.connect(view / 'inbox.sqlite3') as db:  # the schema before `reason`
+                db.execute('CREATE TABLE changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0)')
+                db.execute('CREATE TABLE reservations (id TEXT PRIMARY KEY, card INTEGER UNIQUE NOT NULL)')
+            numbers, errors = self.first_use(view)
+            self.assertEqual(errors, [])
+            self.assertEqual(numbers, list(range(2, 10)))
+            with sqlite3.connect(view / 'inbox.sqlite3') as db:
+                self.assertIn('reason', {row[1] for row in db.execute('PRAGMA table_info(changes)')})
+
     def test_deleted_historical_ticket_is_not_reused(self):
         def git(*args):
             subprocess.run(['git', '-C', str(self.root), *args], check=True, capture_output=True)
@@ -125,6 +173,62 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.request('/api/check-change', {'id': 'two'})['blocked_by'], ['one'])
         with self.assertRaises(HTTPError): self.request('/api/applied', {'ids': ['one', 'unknown']})
         self.assertEqual(self.server.inbox.state()['applied'], [])
+
+    def other(self, event_id, body='Other'):
+        path = 'todo/002-second.md'
+        (self.board / path).write_text('---\nid: 2\ntitle: Second\n---\n') if not (self.board / path).exists() else None
+        return {**self.change(event_id), 'card': 2, 'before': {path: (self.board / path).read_text()},
+                'writes': {path: body}}
+
+    def test_cancel_withdraws_a_change_and_later_ones_on_its_files(self):
+        first = self.change('one'); second = self.other('two'); second['requires'] = ['one']
+        third = self.change('three', body='Again'); third['requires'] = ['one', 'two']
+        for event in (first, second, third):
+            self.request('/api/changes', event)
+        plan = self.request('/api/cancel', {'ids': ['one'], 'dry_run': True})
+        self.assertEqual(plan['cancelled'], ['one', 'three'])
+        self.assertEqual(plan['paths'], ['todo/001-first.md'])
+        self.assertEqual(len(self.request('/api/changes')), 3, 'a dry run changes nothing')
+        self.assertEqual(self.request('/api/cancel', {'ids': ['one']})['cancelled'], ['one', 'three'])
+        pending = self.request('/api/changes')
+        self.assertEqual([e['id'] for e in pending], ['two'])
+        self.assertEqual(pending[0]['requires'], [], 'a cancelled prerequisite is no longer required')
+        self.assertEqual(self.request('/api/check-change', {'id': 'two'})['blocked_by'], [])
+        self.assertEqual(self.request('/api/check-change', {'id': 'one'}), {'cancelled': True})
+        state = serve.Inbox(self.view, self.board).state()
+        self.assertEqual([q['id'] for q in state['queue']], ['two'])
+        self.assertEqual(state['cancelled'], ['one', 'three'])
+        self.request('/api/changes', first)
+        self.assertEqual([e['id'] for e in self.request('/api/changes')], ['two'], 'a retry stays cancelled')
+        with self.assertRaises(HTTPError): self.request('/api/applied', {'ids': ['two', 'one']})
+        self.assertEqual(self.server.inbox.state()['applied'], [], 'acknowledging a cancelled change rolls back')
+        with self.assertRaises(HTTPError): self.request('/api/change-status', {'id': 'one', 'reason': 'x'})
+        self.assertIn('Before', (self.board / 'todo/001-first.md').read_text(), 'the server never writes the board')
+
+    def test_cancel_refuses_applied_changes_and_tombstones_unseen_ones(self):
+        self.request('/api/changes', self.change('one'))
+        self.request('/api/applied', {'ids': ['one']})
+        with self.assertRaises(HTTPError): self.request('/api/cancel', {'ids': ['one']})
+        self.assertEqual(self.request('/api/cancel', {'ids': ['late']})['cancelled'], ['late'])
+        self.request('/api/changes', self.change('late'))
+        self.assertEqual(self.request('/api/changes'), [], 'a delivery that arrives after its cancel stays out')
+        with self.assertRaises(HTTPError): self.request('/api/cancel', {'ids': []})
+        with self.assertRaises(HTTPError): self.request('/api/cancel', {'ids': ['../x']})
+
+    def test_an_old_inbox_gains_cancellation(self):
+        event = self.change('old')
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        db = self.view / 'inbox.sqlite3'
+        db.unlink()
+        with sqlite3.connect(db) as conn:
+            conn.execute('CREATE TABLE changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0)')
+            conn.execute('INSERT INTO changes (id, payload) VALUES (?, ?)', ('old', json.dumps(event)))
+        conn.close()
+        self.server = serve.DashboardServer(('127.0.0.1', 0), self.view, self.board)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.url = f'http://127.0.0.1:{self.server.server_port}'
+        self.assertEqual(self.request('/api/cancel', {'ids': ['old']})['cancelled'], ['old'])
+        self.assertEqual(self.server.inbox.state()['queue'], [])
 
     def test_reject_bad_paths_mismatched_retry_and_unreserved_create(self):
         event = self.change(); event['writes'] = {'../escape.md': 'x'}; event['before'] = {'../escape.md': None}

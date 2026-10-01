@@ -83,24 +83,67 @@ body { background: var(--background); color: var(--foreground); }
 .kb-app { display: flex; flex-direction: column; height: 100vh; }
 
 .kb-topbar {
-  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 1rem;
   padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border);
 }
 
-/* Columns fill the height, so a card can be dropped anywhere in them. */
+/*
+ * The board: a row of column headers, then the swimlanes, each a row of card lists, one per
+ * column. Without lanes there is one lane, and its lists fill the height, so a card can be
+ * dropped anywhere in a column. With lanes (a scope field) the board scrolls instead.
+ */
 .kb-board {
-  flex: 1; min-height: 0; display: flex; gap: 0.75rem;
-  padding: 0.75rem 1.25rem 1rem; overflow-x: auto;
+  --kb-column-width: 18rem;
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 0.75rem;
+  padding: 0.75rem 1.25rem 1rem; overflow: auto;
 }
-.kb-column {
-  flex: 0 0 18rem; display: flex; flex-direction: column; min-height: 0;
+.kb-board-head, .kb-lane-body {
+  display: grid; grid-template-columns: repeat(var(--kb-columns), var(--kb-column-width)); gap: 0.75rem;
+}
+.kb-board-head { position: sticky; top: 0; z-index: 2; background: var(--background); }
+.kb-column { background: var(--muted); border: 1px solid var(--border); border-radius: var(--radius); }
+.kb-column-header { display: flex; align-items: center; gap: 0.5rem; padding: 0.625rem 0.75rem; }
+.kb-board:not(.kb-has-lanes) .kb-lane, .kb-board:not(.kb-has-lanes) .kb-lane-body { flex: 1; min-height: 0; }
+.kb-board:not(.kb-has-lanes) .kb-lane { display: flex; flex-direction: column; }
+.kb-cards {
+  min-height: 3rem; overflow-y: auto; list-style: none; margin: 0;
+  padding: 0.5rem; display: flex; flex-direction: column; gap: 0.5rem;
   background: var(--muted); border: 1px solid var(--border); border-radius: var(--radius);
 }
-.kb-column-header { display: flex; align-items: center; gap: 0.5rem; padding: 0.625rem 0.75rem; }
-.kb-cards {
-  flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0;
-  padding: 0 0.5rem 0.75rem; display: flex; flex-direction: column; gap: 0.5rem;
+.kb-lane { display: flex; flex-direction: column; gap: 0.5rem; }
+.kb-lane-header {
+  position: sticky; left: 0; align-self: flex-start; display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.25rem 0.5rem; border-radius: calc(var(--radius) - 2px); background: none; border: 0; color: inherit; cursor: pointer;
 }
+.kb-lane-header:hover { background: var(--accent); }
+.kb-lane-header:focus-visible { outline: 2px solid var(--ring); }
+.kb-chevron { display: inline-flex; transition: transform 0.15s; }
+.kb-lane-header[aria-expanded="true"] .kb-chevron { transform: rotate(90deg); }
+
+/* The outline: initiatives, their epics, each epic's cards. */
+.kb-view-switch { display: inline-flex; gap: 0.125rem; padding: 0.125rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.kb-outline { flex: 1; min-height: 0; overflow: auto; padding: 1rem 1.25rem 2rem; }
+.kb-outline-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.kb-outline-list .kb-outline-list { margin: 0.5rem 0 0 1.25rem; padding-left: 0.75rem; border-left: 1px solid var(--border); }
+.kb-node > .kb-node-row, .kb-node-loose > .kb-node-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; }
+.kb-node[data-depth="0"] > .kb-node-row { padding: 0.5rem 0.75rem; background: var(--muted); border: 1px solid var(--border); border-radius: var(--radius); }
+.kb-node-toggle {
+  flex: none; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem;
+  margin-right: -0.375rem; padding: 0; border: 0; border-radius: calc(var(--radius) - 4px); background: none; color: inherit; cursor: pointer;
+}
+button.kb-node-toggle:hover { background: var(--accent); }
+button.kb-node-toggle:focus-visible { outline: 2px solid var(--ring); }
+.kb-node-toggle[aria-expanded="true"] .kb-chevron { transform: rotate(90deg); }
+.kb-node-title { display: inline-flex; align-items: baseline; gap: 0.5rem; background: none; border: 0; padding: 0; color: inherit; cursor: pointer; text-align: left; }
+.kb-node-title:hover .font-medium { text-decoration: underline; }
+.kb-node-progress { display: inline-flex; align-items: center; gap: 0.375rem; }
+.kb-node-progress .kb-progress { width: 6rem; }
+.kb-node-stories { list-style: none; margin: 0.375rem 0 0 1.25rem; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.875rem; }
+.kb-node-story { display: flex; align-items: center; gap: 0.5rem; }
+.kb-node-story a { color: inherit; text-decoration: none; }
+.kb-node-story a:hover { text-decoration: underline; }
+.kb-node-story.kb-done a { color: var(--muted-foreground); }
+.kb-node-loose { margin-top: 1rem; }
 /* Tiles keep their height: the list scrolls instead. */
 .kb-cards > * { flex-shrink: 0; }
 
@@ -217,6 +260,7 @@ body { background: var(--background); color: var(--foreground); }
 /* Rendered Markdown: the card's details. */
 .kb-markdown { font-size: 0.875rem; line-height: 1.6; overflow-wrap: anywhere; }
 .kb-markdown > :first-child { margin-top: 0; }
+.kb-markdown img { max-width: 100%; height: auto; border-radius: 0.375rem; border: 1px solid var(--border); }
 .kb-markdown h1, .kb-markdown h2, .kb-markdown h3, .kb-markdown h4 { font-weight: 600; line-height: 1.3; margin: 1.25em 0 0.5em; }
 .kb-markdown h1 { font-size: 1.25rem; }
 .kb-markdown h2 { font-size: 1.0625rem; }
@@ -303,7 +347,57 @@ body { background: var(--background); color: var(--foreground); }
 
 .kb-delivery-error { padding: .75rem 1.25rem; background: var(--muted); border-bottom: 1px solid var(--border); font-size: .875rem; }
 
-.kb-change-status { padding: 0 1.5rem; font-size: .8rem; color: var(--muted-foreground); max-height: 8rem; overflow: auto; }
-.kb-change-status:empty { display: none; }
+/* The notifications bell: the changes waiting for the agent and what the toasts said. */
+.kb-bell { position: relative; }
+.kb-bell > .btn { position: relative; }
+.kb-bell-count {
+  min-width: 1.125rem; height: 1.125rem; padding: 0 .3rem; border-radius: 999px; font-size: .6875rem; font-weight: 600;
+  line-height: 1.125rem; text-align: center; background: var(--primary); color: var(--primary-foreground);
+}
+.kb-bell-panel {
+  position: absolute; top: calc(100% + .375rem); right: 0; z-index: 60; width: min(24rem, calc(100vw - 2rem));
+  max-height: min(32rem, calc(100vh - 6rem)); overflow-y: auto; padding: .25rem 0;
+  background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 10px 24px -12px rgb(0 0 0 / .35); font-size: .8125rem;
+}
+.kb-bell-panel section + section { border-top: 1px solid var(--border); }
+.kb-bell-heading {
+  display: flex; align-items: center; justify-content: space-between; min-height: 2rem; margin: 0;
+  padding: .375rem .875rem 0; font-size: .75rem; font-weight: 600; color: var(--muted-foreground);
+}
+.kb-bell-heading .btn { width: auto; }
+.kb-bell-item { padding: .375rem .875rem; overflow-wrap: anywhere; border-left: 3px solid transparent; }
+.kb-bell-item[data-tone="done"] { border-left-color: var(--kb-green); }
+.kb-bell-item[data-tone="error"] { border-left-color: var(--destructive); }
+.kb-bell-waiting { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.kb-bell-waiting .btn { flex: none; width: auto; }
+.kb-bell-item[data-tone="muted"], .kb-toast[data-tone="muted"] { --kb-toast: var(--kb-gray); border-left-color: var(--kb-gray); }
+.kb-cancel-list { margin: 0 0 .75rem; padding-left: 1.25rem; list-style: disc; font-size: .875rem; }
+.kb-cancel-list:empty { display: none; }
+.kb-bell-time { float: right; margin-left: .5rem; color: var(--muted-foreground); font-size: .75rem; }
+.kb-bell-empty { margin: 0; padding: .375rem .875rem .625rem; color: var(--muted-foreground); }
+
+/* Toasts: changes and problems, stacked in the top right below the top bar (app.js, notify). */
+.kb-toasts {
+  position: fixed; top: var(--kb-toasts-top, 4.5rem); right: 1rem; z-index: 50; width: min(24rem, calc(100vw - 2rem));
+  max-height: calc(100vh - var(--kb-toasts-top, 4.5rem) - 1rem); overflow-y: auto; display: flex; flex-direction: column; gap: .5rem;
+  pointer-events: none;
+}
+.kb-toasts:empty { display: none; }
+.kb-toast {
+  pointer-events: auto; display: grid; grid-template-columns: 1fr auto; align-items: center; gap: .25rem .5rem;
+  padding: .625rem .5rem .75rem .875rem; font-size: .875rem;
+  background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border);
+  border-left: 4px solid var(--kb-toast, var(--primary)); border-radius: var(--radius);
+  box-shadow: 0 10px 24px -12px rgb(0 0 0 / .35); animation: kb-toast-in .18s ease-out;
+}
+.kb-toast[data-tone="done"] { --kb-toast: var(--kb-green); }
+.kb-toast[data-tone="error"] { --kb-toast: var(--destructive); }
+.kb-toast-title { font-weight: 600; }
+.kb-toast-text { grid-column: 1 / -1; margin: 0; padding-right: .375rem; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.kb-toast > .btn:not(.kb-toast-close) { grid-column: 1 / -1; justify-self: start; width: auto; margin-top: .25rem; }
+.kb-toast-close { font-size: 1.125rem; line-height: 1; }
+@keyframes kb-toast-in { from { opacity: 0; transform: translateY(-.375rem); } }
+@media (prefers-reduced-motion: reduce) { .kb-toast { animation: none; } }
 #schema-notice .btn, #migration-review .btn { margin: .5rem .5rem .5rem 0; }
 #schema-notice, #migration-review, .kb-settings-incoming { max-height: 45vh; overflow: auto; }
